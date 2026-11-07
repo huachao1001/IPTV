@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 清晰度胶囊：未选中半透明，选中态实心蓝，焦点态描边 -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_focused="true">
+        <shape android:shape="rectangle">
+            <solid android:color="#FF5AA0FF" />
+            <stroke
+                android:width="2.5dp"
+                android:color="#FFFFFFFF" />
+            <corners android:radius="999dp" />
+        </shape>
+    </item>
+    <item android:state_selected="true">
+        <shape android:shape="rectangle">
+            <solid android:color="#FF3D8BFD" />
+            <corners android:radius="999dp" />
+        </shape>
+    </item>
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#33FFFFFF" />
+            <corners android:radius="999dp" />
+        </shape>
+    </item>
+</selector>

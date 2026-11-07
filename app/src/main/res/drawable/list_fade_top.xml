@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 列表顶部渐隐：滚到边缘的半截行淡出，而不是被硬切一刀 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android">
+    <gradient
+        android:angle="270"
+        android:endColor="#000B0F16"
+        android:startColor="#FA0B0F16" />
+</shape>

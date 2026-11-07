@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 半透明圆角胶囊，用于按钮和小标签；聚焦时换成实心蓝 -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_focused="true" android:drawable="@drawable/settings_btn_focus" />
+    <item android:state_pressed="true" android:drawable="@drawable/settings_btn_focus" />
+    <item android:drawable="@drawable/settings_btn_normal" />
+</selector>

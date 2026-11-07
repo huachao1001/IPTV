@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 频道列表栏：左侧实底，向右渐隐，避免出现生硬的竖切边 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android">
+    <gradient
+        android:angle="0"
+        android:centerColor="#E60B0F16"
+        android:endColor="#000B0F16"
+        android:startColor="#F70A0E14" />
+</shape>

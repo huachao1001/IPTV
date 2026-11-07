@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 行内元信息小标签（清晰度、信号源序号等） -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android">
+    <solid android:color="#26FFFFFF" />
+    <corners android:radius="3dp" />
+</shape>

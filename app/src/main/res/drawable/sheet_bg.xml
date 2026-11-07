@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 底部落地窗：上沿半透明渐变到底部深色，保证文字可读 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android">
+    <gradient
+        android:angle="270"
+        android:centerColor="#B30A0E15"
+        android:endColor="#F20A0E15"
+        android:startColor="#000A0E15" />
+</shape>

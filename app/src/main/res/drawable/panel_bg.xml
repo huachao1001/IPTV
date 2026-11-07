@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 左侧抽屉：半透明深色，右侧略微加深让画面透出来 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android">
+    <gradient
+        android:angle="0"
+        android:endColor="#B80A0E15"
+        android:startColor="#E60A0E15" />
+</shape>

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 品牌主色：偏冷的蓝，电视上不刺眼 -->
+    <color name="accent">#3D8BFD</color>
+    <color name="accent_dim">#2A5FA8</color>
+    <color name="accent_glow">#333D8BFD</color>
+    <color name="accent_pressed">#5AA0FF</color>
+
+    <!-- 底层背景：近黑带一点蓝，比纯黑有层次 -->
+    <color name="bg_deep">#0A0D12</color>
+    <color name="bg_panel">#121722</color>
+    <color name="bg_panel_raised">#1A2130</color>
+    <color name="scrim">#CC080B10</color>
+
+    <!-- 文字 -->
+    <color name="text_primary">#FFFFFF</color>
+    <color name="text_secondary">#B8C2D4</color>
+    <color name="text_tertiary">#7E8A9E</color>
+
+    <!-- 分组导航文字：选中/焦点态由 res/color/group_text.xml 切换为纯白 -->
+
+    <!-- 状态色 -->
+    <color name="state_playing">#38C172</color>
+    <color name="state_dot">#FF5C5C</color>
+
+    <!-- 描边与分隔 -->
+    <color name="line_soft">#1FFFFFFF</color>
+    <color name="line_strong">#33FFFFFF</color>
+</resources>

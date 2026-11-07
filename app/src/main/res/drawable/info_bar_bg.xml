@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 底部信息条：向上渐隐融合画面，底部保持实底 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android">
+    <gradient
+        android:angle="270"
+        android:centerColor="#C00A0E16"
+        android:endColor="#FA080C12"
+        android:startColor="#00080C12" />
+</shape>
