@@ -35,13 +35,16 @@ public final class LiveRenderersFactory extends DefaultRenderersFactory {
             long allowedVideoJoiningTimeMs,
             ArrayList<Renderer> out) {
         // 扩展渲染器模式本来就是 OFF，这里直接放自己的实现即可
-        out.add(new LiveVideoRenderer(
+        LiveVideoRenderer renderer = new LiveVideoRenderer(
                 context,
                 mediaCodecSelector,
                 allowedVideoJoiningTimeMs,
                 enableDecoderFallback,
                 eventHandler,
                 eventListener,
-                MAX_DROPPED_VIDEO_FRAME_COUNT_TO_NOTIFY));
+                MAX_DROPPED_VIDEO_FRAME_COUNT_TO_NOTIFY);
+        // 登记实例，换流时由 PlaybackTuning.resetStreamState() 清显示时间基准
+        PlaybackTuning.setLastRenderer(renderer);
+        out.add(renderer);
     }
 }

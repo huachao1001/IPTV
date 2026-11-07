@@ -265,6 +265,61 @@
         </LinearLayout>
     </LinearLayout>
 
+    <!-- ==================== 抽屉预览卡 ====================
+         焦点在频道列表上移动时，把目标频道的台标和名称浮在画面右下，
+         用户不必先按确定就能看清"即将切到哪个台"。
+         只在抽屉打开且焦点落在某一行时出现，点击确定后自动消失。 -->
+    <LinearLayout
+        android:id="@+id/previewCard"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|end"
+        android:layout_marginEnd="56dp"
+        android:layout_marginBottom="56dp"
+        android:background="@drawable/preview_card_bg"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="26dp"
+        android:paddingTop="22dp"
+        android:paddingEnd="34dp"
+        android:paddingBottom="22dp"
+        android:visibility="gone">
+
+        <ImageView
+            android:id="@+id/previewLogo"
+            android:layout_width="120dp"
+            android:layout_height="60dp"
+            android:contentDescription="@null"
+            android:scaleType="fitCenter" />
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="22dp"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/previewName"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:textColor="@color/text_primary"
+                android:textSize="30sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/previewMeta"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="3dp"
+                android:alpha="0.6"
+                android:maxLines="1"
+                android:textColor="@color/text_secondary"
+                android:textSize="18sp" />
+        </LinearLayout>
+    </LinearLayout>
+
     <!-- ==================== 底部信息条 ==================== -->
     <LinearLayout
         android:id="@+id/bottomArea"

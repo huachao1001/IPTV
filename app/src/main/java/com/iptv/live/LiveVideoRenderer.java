@@ -44,6 +44,62 @@ public final class LiveVideoRenderer extends MediaCodecVideoRenderer {
     private long skippedFrames = 0;
     private long resets = 0;
 
+    /*
+     * ---- 渲染线程侧的权威统计（诊断用） ----
+     * 主线程读 DecoderCounters 只能看到"总共渲染了多少帧"，
+     * 分不清"没帧可渲染"和"帧被丢弃"。这里在真正送显的线程上计数，
+     * 每 2 秒打一条：查清画面停顿时到底是没数据、被去重丢掉、还是被判迟到。
+     */
+    private long statRendered = 0;
+    private long statTooLate = 0;
+    private long statDropped = 0;
+    private long statWindowStartMs = 0;
+    private long statMinPtsUs = Long.MAX_VALUE;
+    private long statMaxPtsUs = Long.MIN_VALUE;
+
+    /** 单次送显出口，统一记账，避免各分支漏统计。 */
+    private void noteRender(long ptsUs, boolean tooLate) {
+        statRendered++;
+        if (tooLate) {
+            statTooLate++;
+        }
+        if (ptsUs < statMinPtsUs) {
+            statMinPtsUs = ptsUs;
+        }
+        if (ptsUs > statMaxPtsUs) {
+            statMaxPtsUs = ptsUs;
+        }
+    }
+
+    /** 每 2 秒输出一次渲染侧统计，定位"画面停顿"的真实成因。 */
+    private void flushStats() {
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (statWindowStartMs == 0) {
+            statWindowStartMs = now;
+            return;
+        }
+        long span = now - statWindowStartMs;
+        if (span < 2000) {
+            return;
+        }
+        double fps = statRendered * 1000.0 / span;
+        long spanUs = statMaxPtsUs > statMinPtsUs ? statMaxPtsUs - statMinPtsUs : 0;
+        android.util.Log.i("IPTVVIDEO", "render win=" + span + "ms"
+                + " rendered=" + statRendered
+                + " fps=" + String.format(java.util.Locale.US, "%.1f", fps)
+                + " tooLate=" + statTooLate
+                + " dedupDropped=" + statDropped
+                + " ptsSpanMs=" + (spanUs / 1000)
+                // ptsSpan 明显小于窗口时长，说明时间轴上有空洞（片间不连续）
+                + " highWater=" + (highWaterUs == C.TIME_UNSET ? "-" : String.valueOf(highWaterUs / 1000)));
+        statRendered = 0;
+        statTooLate = 0;
+        statDropped = 0;
+        statMinPtsUs = Long.MAX_VALUE;
+        statMaxPtsUs = Long.MIN_VALUE;
+        statWindowStartMs = now;
+    }
+
     public LiveVideoRenderer(
             Context context,
             MediaCodecSelector mediaCodecSelector,
@@ -70,6 +126,11 @@ public final class LiveVideoRenderer extends MediaCodecVideoRenderer {
             boolean isLastBuffer,
             Format format) throws ExoPlaybackException {
 
+        // 每进入渲染线程一次就推进一次统计窗口。帧流正常时每 2 秒必有一条
+        // IPTVVIDEO；某段时间完全没有这条日志，就说明渲染线程根本没拿到输出帧
+        // （解码侧断供），和"拿到了却被丢弃"是两种完全不同的病因。
+        flushStats();
+
         // 结尾帧必须交给父类，否则流结束时的 flush 流程会卡住
         if (codec != null && !isDecodeOnlyBuffer && !isLastBuffer
                 && highWaterUs != C.TIME_UNSET) {
@@ -93,6 +154,8 @@ public final class LiveVideoRenderer extends MediaCodecVideoRenderer {
                                 + " total=" + skippedFrames);
                     }
                     skipOutputBuffer(codec, bufferIndex, bufferPresentationTimeUs);
+                    // 有数据但被去重丢弃 —— 与"压根没数据"要分开统计
+                    statDropped++;
                     return true;
                 }
             } else {
@@ -104,7 +167,10 @@ public final class LiveVideoRenderer extends MediaCodecVideoRenderer {
                 positionUs, elapsedRealtimeUs, codec, buffer, bufferIndex, bufferFlags,
                 sampleCount, bufferPresentationTimeUs, isDecodeOnlyBuffer, isLastBuffer, format);
         if (handled && !isDecodeOnlyBuffer) {
-            // 内容进度推进到这一帧（含被父类判为过晚丢弃的帧）
+            // 内容进度推进到这一帧（含被父类判为过晚丢弃的帧）。
+            // tooLate 用来区分"正常送显"与"迟到被父类丢掉"：
+            // 迟到帧一多，画面就是持续的顿挫，而平均 fps 可能仍是满的。
+            noteRender(bufferPresentationTimeUs, bufferPresentationTimeUs < positionUs);
             highWaterUs = bufferPresentationTimeUs;
         }
         return handled;
@@ -127,6 +193,19 @@ public final class LiveVideoRenderer extends MediaCodecVideoRenderer {
         resetBaseline();
     }
 
+    /**
+     * 换流时主动清基准。
+     *
+     * <p>渲染器实例在同一个播放器里是复用的，换频道不一定触发
+     * {@link #onEnabled}{@code /}{@link #onDisabled}，基准就会带着上一条流的
+     * PTS 留下来。新流 PTS 从头开始，于是每一帧都小于基准、全被判成重复帧丢掉，
+     * 画面一直冻到 {@link #FREEZE_LIMIT_US} 兜底才恢复。
+     * 因此每路新流准备播放前必须显式清一次。
+     */
+    public void resetForNewStream() {
+        resetBaseline();
+    }
+
     @Override
     protected void onDisabled() {
         super.onDisabled();
@@ -136,6 +215,12 @@ public final class LiveVideoRenderer extends MediaCodecVideoRenderer {
     private void resetBaseline() {
         highWaterUs = C.TIME_UNSET;
         dropSinceUs = C.TIME_UNSET;
+        statWindowStartMs = 0;
+        statRendered = 0;
+        statTooLate = 0;
+        statDropped = 0;
+        statMinPtsUs = Long.MAX_VALUE;
+        statMaxPtsUs = Long.MIN_VALUE;
     }
 
     /** 已丢弃的重复帧总数，排查用。 */

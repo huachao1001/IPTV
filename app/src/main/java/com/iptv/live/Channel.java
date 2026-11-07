@@ -71,6 +71,26 @@ public class Channel {
         Collections.sort(sources, (a, b) -> rank(b.quality) - rank(a.quality));
     }
 
+    /**
+     * 按节目单自带的响应耗时升序排列，同一清晰度内最快的排前面。
+     *
+     * <p>换台时直接用第 0 条起播，响应越快的线路出画面越快。
+     * 没有清晰度标记的线路（rank 相同）之间也按响应耗时排，
+     * 这样"最快可播"永远是第一条。
+     */
+    public void sortBySpeed() {
+        Collections.sort(sources, (a, b) -> {
+            int qa = rank(a.quality);
+            int qb = rank(b.quality);
+            if (qa != qb) {
+                return qb - qa;
+            }
+            int ra = a.responseMs > 0 ? a.responseMs : Integer.MAX_VALUE;
+            int rb = b.responseMs > 0 ? b.responseMs : Integer.MAX_VALUE;
+            return ra - rb;
+        });
+    }
+
     static int rank(String q) {
         if (q == null || q.isEmpty()) {
             return 0;

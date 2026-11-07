@@ -92,8 +92,9 @@ public final class PlaylistParser {
         reader.close();
         List<Channel> result = new ArrayList<>(merged.values());
         for (Channel c : result) {
-            // 清晰度高的排前面，用户先看到最好的画质
-            c.sortByQuality();
+            // 清晰度高优先，同清晰度内响应快的排前面：
+            // 换台时直接拿第一条起播，出画面最快
+            c.sortBySpeed();
         }
         return result;
     }

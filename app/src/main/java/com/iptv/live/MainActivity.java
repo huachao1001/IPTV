@@ -18,6 +18,7 @@ import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
+import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.PlaybackParameters;
@@ -100,6 +101,12 @@ public class MainActivity extends Activity {
     private TextView drawerSub;
     private TextView emptyTip;
 
+    /** 抽屉内焦点预览卡：显示目标频道的台标与名称。 */
+    private View previewCard;
+    private android.widget.ImageView previewLogo;
+    private TextView previewName;
+    private TextView previewMeta;
+
     /** 全量频道，跨分组保留。 */
     private final List<Channel> master = new ArrayList<>();
     /** 当前分组下的频道，适配器直接读它。 */
@@ -116,6 +123,14 @@ public class MainActivity extends Activity {
     private int currentGroup = 0;
     /** 当前频道在 channels 里的下标，-1 表示本组内没有正在播放的频道。 */
     private int current = -1;
+    /**
+     * 换台令牌：每次 play() 自增。
+     *
+     * <p>异步回调（探测、精修）都带着发起时的令牌回来，
+     * 令牌对不上说明期间又换过台，结果必须丢弃。
+     * 只比 current 是不够的——用户可能切走又切回同一个台。
+     */
+    private int playToken = 0;
     /** 正在播放的频道名，切分组时用它找回高亮。 */
     private String playingName = "";
     /** 当前频道内第几路流，用于失败换源。 */
@@ -255,6 +270,169 @@ public class MainActivity extends Activity {
             startPlayback(channels.get(current));
         }
     };
+    /** 起播超时：准备这么久仍未出画面，就判定这条线路不行，换下一条。 */
+    private static final long STARTUP_TIMEOUT_MS = 7_000;
+    /** 起播看门狗的轮询间隔。 */
+    private static final long STARTUP_POLL_MS = 500;
+    /**
+     * 起播连续失败多少轮就放弃。
+     *
+     * <p>节目单里确实有害群之马（实测某台三条线路都只有 100~440KB/s，
+     * 需求 1074KB/s），这种台怎么换都起不来。若不停重试，
+     * 看门狗会把 CPU 和带宽全耗在这个台上，用户看到的是永远转圈。
+     * 到上限就停下来，等用户自己换台。
+     */
+    private static final int STARTUP_GIVE_UP_ROUNDS = 4;
+
+    /** 当前这轮起播已经连续失败了几次。 */
+    private int startupFailures = 0;
+
+    /**
+     * 静默卡死检测：状态是 READY、也"在播"，但播放时钟不再前进。
+     *
+     * <p>现有两个看门狗都盖不住这种形态——起播看门狗只管"还没出过画面"，
+     * 卡顿看门狗只在 STATE_BUFFERING 下启动。一旦停在 READY 而时钟不走，
+     * 日志里表现为 {@code state=3 pos=-42917} 一路往负方向滑、画面永久定格，
+     * 两个看门狗都不触发，只能靠用户手动换台。
+     *
+     * <p>判定逻辑见 {@link StallDetector}：只有位置"严格向前"才算进展，
+     * 因为直播位置在分片滑出窗口时会整体后退（实测每 5 秒退 5000ms），
+     * 把"变了"当成"在走"就永远检测不到。
+     */
+    private final StallDetector stallDetector = new StallDetector();
+    /** 静默卡死的检测间隔。 */
+    private static final long SILENT_STALL_TICK_MS = 1_000L;
+    /** 连续静默卡死多少轮就放弃这个频道，避免无限重启。 */
+    private static final int SILENT_STALL_GIVE_UP = 5;
+    /** 本次播放已经因为静默卡死重启过几次。 */
+    private int silentStallRounds = 0;
+
+    private final Runnable silentStallTick = new Runnable() {
+        @Override
+        public void run() {
+            ExoPlayer p = player;
+            if (p != null) {
+                boolean eligible = hasPlayed
+                        && p.isPlaying()
+                        && p.getPlaybackState() == Player.STATE_READY
+                        && p.getPlaybackSuppressionReason()
+                        == Player.PLAYBACK_SUPPRESSION_REASON_NONE
+                        && p.getPlayerError() == null;
+                long now = System.currentTimeMillis();
+                if (stallDetector.sample(eligible, p.getCurrentPosition(), now)) {
+                    onSilentStall(p);
+                }
+            }
+            ui.postDelayed(this, SILENT_STALL_TICK_MS);
+        }
+    };
+
+    /**
+     * 状态 READY 但时钟停走：重开这一路流。
+     *
+     * <p>不解码器/音频渲染器卡死时，seek 和等待都没用，只有重建播放管线
+     * 才能恢复（与 xplayer 的处理一致：位置停 6 秒就重连，连续两次还卡
+     * 就换一条解码管线）。这里先重开同一路；连续多次仍卡才换线。
+     */
+    private void onSilentStall(ExoPlayer p) {
+        if (current < 0 || current >= channels.size()) {
+            return;
+        }
+        Channel c = channels.get(current);
+        android.util.Log.w("IPTVSTALL", "silent-stall ch=" + c.name
+                + " pos=" + p.getCurrentPosition()
+                + " buffered=" + p.getTotalBufferedDuration()
+                + " round=" + (silentStallRounds + 1));
+        stallDetector.reset();
+        silentStallRounds++;
+        if (silentStallRounds > SILENT_STALL_GIVE_UP) {
+            // 这个台的线路怎么重开都卡，别再耗着，把状态清干净等用户换台
+            android.util.Log.w("IPTVSTALL", "silent-stall give up ch=" + c.name);
+            silentStallRounds = 0;
+            loading.setVisibility(View.GONE);
+            showHint("该频道播放异常，请换个台");
+            return;
+        }
+        if (silentStallRounds >= 2) {
+            // 重开同一路救不回来，多半是这条线路的问题，换一条
+            repickSource();
+            return;
+        }
+        startPlayback(c);
+    }
+
+    /**
+     * 起播看门狗。
+     *
+     * <p>探测只能测到分片开头的突发速率，与真实持续速率能差四五倍，
+     * 于是经常出现"探测说能播、实际起不来"——播放器安静地停在
+     * STATE_BUFFERING，缓冲量迟迟不到起播门槛，用户对着黑屏干等。
+     * 原来没有任何机制能从这个状态里出来。
+     *
+     * <p>这里给每次起播设一个上限：超时就把这条线路标记为喂不饱，
+     * 静默换下一条，而不是让用户无限等。
+     */
+    private final Runnable startupWatchdog = new Runnable() {
+        @Override
+        public void run() {
+            if (player == null) {
+                return;
+            }
+            int state = player.getPlaybackState();
+            if (state == Player.STATE_READY) {
+                return;
+            }
+            // 起播期间不计缓冲增长，只看"有没有出画面"
+            if (state == Player.STATE_ENDED) {
+                return;
+            }
+            long waited = System.currentTimeMillis() - startupAt;
+            if (waited < STARTUP_TIMEOUT_MS) {
+                ui.postDelayed(this, STARTUP_POLL_MS);
+                return;
+            }
+            if (current < 0 || current >= channels.size()) {
+                return;
+            }
+            Channel c = channels.get(current);
+            Channel.Source s = c.source(sourceIndex);
+            android.util.Log.w("IPTVSTALL", "startup-timeout ch=" + c.name
+                    + " idx=" + sourceIndex + " waited=" + waited
+                    + " buffered=" + player.getTotalBufferedDuration());
+            // 这条线路起不来，记成喂不饱，下次不再优先选它
+            s.starved = Boolean.TRUE;
+            SourceMemory.remove(MainActivity.this, c.name);
+            startupFailures++;
+            if (startupFailures >= STARTUP_GIVE_UP_ROUNDS) {
+                // 这个台的线路全都不行，别再耗下去，把状态清干净等用户换台
+                android.util.Log.w("IPTVSTALL", "give up ch=" + c.name
+                        + " after " + startupFailures + " tries");
+                startupFailures = 0;
+                loading.setVisibility(View.GONE);
+                ui.removeCallbacks(startupWatchdog);
+                showHint("该频道暂时无法播放，请换个台");
+                return;
+            }
+            retryRound = 0;
+            repickSource();
+        }
+    };
+
+    /** 当前这轮起播的起始时刻。 */
+    private long startupAt = 0L;
+
+    private void armStartupWatchdog() {
+        ui.removeCallbacks(startupWatchdog);
+        startupAt = System.currentTimeMillis();
+        ui.postDelayed(startupWatchdog, STARTUP_TIMEOUT_MS);
+    }
+
+    private void disarmStartupWatchdog() {
+        ui.removeCallbacks(startupWatchdog);
+        // 出画面了就说明这个台是好的，失败计数归零
+        startupFailures = 0;
+    }
+
     /**
      * 跟踪媒体分片序号是否连续。
      *
@@ -386,6 +564,49 @@ public class MainActivity extends Activity {
                             .append(g.isSelected()).append(" sup=").append(g.isSupported());
                 }
             }
+            // 帧计数是判断"卡在管线"还是"卡在显示"的决定性依据：
+            // rendered 每秒应约等于内容的帧率（本机是 25fps 的 576i），
+            // dropped/skipped 才是真正被丢掉的帧。三者都正常却仍看着不顺，
+            // 就说明问题在显示侧（25fps 输出到 60Hz 面板的 3:2 下拉），
+            // 不是解码/网络能修的。
+            String frames = "-";
+            androidx.media3.exoplayer.DecoderCounters vc = player.getVideoDecoderCounters();
+            if (vc != null) {
+                vc.ensureUpdated();
+                long now = System.currentTimeMillis();
+                long dt = lastFrameAt == 0 ? 0 : Math.max(1, now - lastFrameAt);
+                int df = lastFrameCount < 0 ? 0 : vc.renderedOutputBufferCount - lastFrameCount;
+                double fps = dt > 0 ? df * 1000.0 / dt : 0;
+                // 帧释放迟到量：渲染器本该在某时刻送出这一帧，实际晚了多少。
+                // 稳定在毫秒级说明排期正常；一旦周期性冲到几十毫秒，
+                // 就是"看着一顿一顿"的直接证据（与平均帧率无关，平均值会掩盖它）。
+                double lateMs = vc.videoFrameProcessingOffsetCount > 0
+                        ? vc.totalVideoFrameProcessingOffsetUs
+                        / 1000.0 / vc.videoFrameProcessingOffsetCount : 0;
+                // 音频时钟同步对照：视频排期跟着音频走，
+                // 若音频帧数也在同一时刻停走，说明卡的是主时钟（音频解码/渲染），
+                // 只有视频停而音频照走，才是视频管线自己的问题。
+                String au = "-";
+                androidx.media3.exoplayer.DecoderCounters ac = player.getAudioDecoderCounters();
+                if (ac != null) {
+                    ac.ensureUpdated();
+                    int da = lastAudioCount < 0 ? 0
+                            : ac.renderedOutputBufferCount - lastAudioCount;
+                    double afps = dt > 0 ? da * 1000.0 / dt : 0;
+                    au = "aRendered=" + ac.renderedOutputBufferCount
+                            + " aFps=" + String.format(Locale.US, "%.1f", afps)
+                            + " aDropped=" + ac.droppedBufferCount;
+                    lastAudioCount = ac.renderedOutputBufferCount;
+                }
+                frames = "rendered=" + vc.renderedOutputBufferCount
+                        + " fps=" + String.format(Locale.US, "%.1f", fps)
+                        + " late=" + String.format(Locale.US, "%.1f", lateMs) + "ms"
+                        + " dropped=" + vc.droppedBufferCount
+                        + " skipped=" + vc.skippedOutputBufferCount
+                        + " " + au;
+                lastFrameAt = now;
+                lastFrameCount = vc.renderedOutputBufferCount;
+            }
             android.util.Log.i("IPTVPLAY", "state=" + player.getPlaybackState()
                     + " supp=" + player.getPlaybackSuppressionReason()
                     + " err=" + (player.getPlayerError() == null ? "-" : player.getPlayerError().errorCode)
@@ -393,12 +614,18 @@ public class MainActivity extends Activity {
                     + " pos=" + player.getCurrentPosition()
                     + " speed=" + player.getPlaybackParameters().speed
                     + " vol=" + player.getVolume()
+                    + " frames[" + frames + "]"
                     + " url=" + (player.getCurrentMediaItem() == null ? "-"
                             : player.getCurrentMediaItem().localConfiguration.uri)
                     + " audio[" + audio + "]");
         } catch (Throwable ignored) {
         }
     }
+
+    /** 上一次采样时的已渲染帧数与时刻，用来算实时帧率。 */
+    private long lastFrameAt = 0L;
+    private int lastFrameCount = -1;
+    private int lastAudioCount = -1;
 
     @Override
     protected void onCreate(@Nullable Bundle bundle) {
@@ -424,6 +651,10 @@ public class MainActivity extends Activity {
         emptyTip = findViewById(R.id.emptyTip);
         list = findViewById(R.id.list);
         groupList = findViewById(R.id.groupList);
+        previewCard = findViewById(R.id.previewCard);
+        previewLogo = findViewById(R.id.previewLogo);
+        previewName = findViewById(R.id.previewName);
+        previewMeta = findViewById(R.id.previewMeta);
 
         // 左栏分组导航
         groupList.setLayoutManager(new LinearLayoutManager(this));
@@ -440,6 +671,7 @@ public class MainActivity extends Activity {
         // 让列表首尾留白，第一行不被标题压住，最后一行不被屏幕边缘切掉
         list.setClipToPadding(true);
         list.setPadding(UiScale.pxW(12), UiScale.pxH(26), UiScale.pxW(12), UiScale.pxH(24));
+        setupFocusPreview();
 
         findViewById(R.id.btnSettings).setOnClickListener(v -> showSettings());
         findViewById(R.id.btnClose).setOnClickListener(v -> closeDrawer());
@@ -473,10 +705,16 @@ public class MainActivity extends Activity {
                 @Override
                 public void onDroppedVideoFrames(EventTime eventTime, int droppedFrames,
                                                  long elapsedMs) {
-                    // 真的掉帧才会让人看出"卡了一下"，重叠帧剔除不算在内
+                    // 真的掉帧才会让人看出"卡了一下"，重叠帧剔除不算在内。
+                    // 这个回调由渲染器线程投递，退出播放页时 player 可能已被置空，
+                    // 不判空会在 onDestroy 后抛 NPE 直接把进程打死（实测崩溃点）。
+                    ExoPlayer p = player;
+                    if (p == null) {
+                        return;
+                    }
                     android.util.Log.i("IPTVVIDEO", "dropped=" + droppedFrames
                             + " elapsedMs=" + elapsedMs
-                            + " buffered=" + player.getTotalBufferedDuration());
+                            + " buffered=" + p.getTotalBufferedDuration());
                 }
             });
             player.addListener(new Player.Listener() {
@@ -499,7 +737,13 @@ public class MainActivity extends Activity {
                         hasPlayed = true;
                         retryRound = 0;
                         ui.removeCallbacks(stallWatchdog);
+                        disarmStartupWatchdog();
                         rebufferStart = 0;
+                        // 这一路真的播起来了，记下来供下次换台秒起播
+                        if (current >= 0 && current < channels.size()) {
+                            Channel c = channels.get(current);
+                            SourceMemory.put(MainActivity.this, c.name, c.url(sourceIndex));
+                        }
                     }
                 }
 
@@ -541,6 +785,7 @@ public class MainActivity extends Activity {
         loadChannels(getIntent().getIntExtra("channel", -1));
         ui.post(tick);
         if (!PREVIEW_ONLY) {
+            ui.post(silentStallTick);
             refreshIfStale();
         }
     }
@@ -651,12 +896,122 @@ public class MainActivity extends Activity {
                 fade.setLayoutParams(flp);
             }
         }
+
+        // 预览卡：字号和台标尺寸都按屏幕高度走，大屏上不会缩成一小块
+        UiScale.padding(previewCard, 26, 22, 34, 22);
+        ViewGroup.LayoutParams plp2 = previewLogo.getLayoutParams();
+        int pLogoH = UiScale.pxH(60);
+        plp2.width = pLogoH * 2;
+        plp2.height = pLogoH;
+        previewLogo.setLayoutParams(plp2);
+        UiScale.margin(previewLogo, 0, 0, 22, 0);
+        UiScale.text(previewName, 30);
+        UiScale.text(previewMeta, 18);
+        ViewGroup.MarginLayoutParams cardLp =
+                (ViewGroup.MarginLayoutParams) previewCard.getLayoutParams();
+        cardLp.rightMargin = UiScale.pxW(56);
+        cardLp.bottomMargin = UiScale.pxH(56);
+        previewCard.setLayoutParams(cardLp);
     }
 
     /** infoGroup 是可选视图，取不到时不影响其他适配。 */
     private TextView infoGroupView() {
         View v = findViewById(R.id.infoGroup);
         return v instanceof TextView ? (TextView) v : null;
+    }
+
+    /* ---------------- 抽屉内焦点预览 ---------------- */
+
+    /**
+     * 焦点在频道列表上移动时，实时预览目标频道。
+     *
+     * <p>用户用遥控器在列表里上下走，往往要看清"这一行是哪个台"才敢按确定。
+     * 光靠行内文字不够直观，所以在画面右下浮一张卡，显示台标 + 名称 + 分组。
+     * 焦点离开列表就收起，真正切台后也收起，不干扰观看。
+     */
+    private void setupFocusPreview() {
+        list.addOnChildAttachStateChangeListener(
+                new RecyclerView.OnChildAttachStateChangeListener() {
+                    @Override
+                    public void onChildViewAttachedToWindow(@NonNull View view) {
+                        // 新行滚进可视区时，如果它正好拿到焦点就补一次预览
+                        if (view.hasFocus()) {
+                            previewFor(view);
+                        }
+                    }
+
+                    @Override
+                    public void onChildViewDetachedFromWindow(@NonNull View view) {
+                    }
+                });
+        // 用焦点变化广播而不是给每行设监听：行是复用的，逐行挂容易漏
+        list.setDescendantFocusability(ViewGroup.FOCUS_AFTER_DESCENDANTS);
+        list.getViewTreeObserver().addOnGlobalFocusChangeListener((oldFocus, newFocus) -> {
+            if (newFocus != null && isInside(newFocus, list)) {
+                previewFor(newFocus);
+            } else {
+                hidePreviewCard();
+            }
+        });
+    }
+
+    /** newFocus 是否在 container 内部。 */
+    private static boolean isInside(View newFocus, View container) {
+        View f = newFocus;
+        while (f != null) {
+            if (f == container) {
+                return true;
+            }
+            if (!(f.getParent() instanceof View)) {
+                return false;
+            }
+            f = (View) f.getParent();
+        }
+        return false;
+    }
+
+    /** 按聚焦的行渲染预览卡。 */
+    private void previewFor(View row) {
+        int pos = list.getChildAdapterPosition(row);
+        if (pos < 0 || pos >= channels.size()) {
+            hidePreviewCard();
+            return;
+        }
+        Channel c = channels.get(pos);
+        renderPreviewCard(c);
+    }
+
+    private void renderPreviewCard(Channel c) {
+        // 正在播放的台不用预览——用户已经在看了，浮一张卡只是噪音
+        if (c.name.equals(playingName) && drawer.getVisibility() == View.VISIBLE) {
+            hidePreviewCard();
+            return;
+        }
+        previewName.setText(c.name);
+        String group = ChannelGroups.displayName(c.group);
+        // 顺手告诉用户这个台有几条线路，换台前心里有数
+        int n = c.sources.size();
+        previewMeta.setText(group + (n > 1 ? " · " + n + " 条线路" : ""));
+        android.graphics.Bitmap bmp = ChannelAdapter.LogoCache.get(this, c.logoKey());
+        if (bmp != null) {
+            previewLogo.setImageBitmap(bmp);
+            previewLogo.setVisibility(View.VISIBLE);
+        } else {
+            previewLogo.setImageDrawable(null);
+            previewLogo.setVisibility(View.GONE);
+        }
+        if (previewCard.getVisibility() != View.VISIBLE) {
+            previewCard.setVisibility(View.VISIBLE);
+            previewCard.setAlpha(0f);
+            previewCard.animate().alpha(1f).setDuration(120).start();
+        }
+    }
+
+    private void hidePreviewCard() {
+        if (previewCard.getVisibility() == View.VISIBLE) {
+            previewCard.animate().cancel();
+            previewCard.setVisibility(View.GONE);
+        }
     }
 
     /* ---------------- 数据装载与分组 ---------------- */
@@ -675,6 +1030,15 @@ public class MainActivity extends Activity {
         rebuildGroups();
         if (pick < 0) {
             pick = getPreferences(MODE_PRIVATE).getInt("current", 0);
+            // 没有历史记录时别盲选第 0 个：节目单按响应耗时排，
+            // 排第一的往往是冷门台（实测 CETV-1 三条线路都喂不动）。
+            // 优先落到 CCTV-1，它是国内直播里最稳的一路。
+            if (pick == 0) {
+                int cctv1 = indexInMaster("CCTV-1");
+                if (cctv1 >= 0) {
+                    pick = cctv1;
+                }
+            }
         }
         if (master.isEmpty()) {
             return;
@@ -791,6 +1155,18 @@ public class MainActivity extends Activity {
         return -1;
     }
 
+    /** 在 master 里按频道名找下标；加载早期 channels 还是空的，用它。 */
+    private int indexInMaster(String name) {
+        if (TextUtils.isEmpty(name)) {
+            return -1;
+        }
+        for (int i = 0; i < master.size(); i++) {
+            if (master.get(i).name.equals(name)) {
+                return i;
+            }
+        }
+        return -1;
+    }
     /* ---------------- 触摸手势 ---------------- */
 
     /**
@@ -868,7 +1244,17 @@ public class MainActivity extends Activity {
 
     /* ---------------- 播放 ---------------- */
 
-    /** 换台入口：先亮界面，再并发挑一路能用的源。 */
+    /**
+     * 换台入口：先用记忆线路秒起播，探测退到后台做精修。
+     *
+     * <p>原实现是"先并发探测全部线路再起播"，{@code SourceProber} 的总预算是
+     * 4.5 秒，于是每次换台都要先空等探测。但用户来回切的多半是那几个台，
+     * 线路早已验证过。这里改成：
+     * <ul>
+     *   <li>有记忆线路 → 立刻起播，探测在后台跑，只有发现明显更好的线路才切；</li>
+     *   <li>没有记忆 → 才走阻塞探测（首次访问该频道）。</li>
+     * </ul>
+     */
     private void play(int index) {
         if (index < 0 || index >= channels.size()) {
             return;
@@ -885,6 +1271,14 @@ public class MainActivity extends Activity {
         lastChunkSeq = -1;
         lastChunkPrefix = "";
         chunkSkips = 0;
+        // 上一次播放的失败计数不能带过来，否则新台第一下失败就可能直接换线
+        retryRound = 0;
+        startupFailures = 0;
+        // 换台是全新会话：静默卡死的计时和重启次数都要清零，
+        // 否则上一路的停滞会被算到新台上，一进台就被判卡死
+        silentStallRounds = 0;
+        stallDetector.reset();
+        playToken++;
 
         // 名字和图标立刻显示，不让用户对着黑屏等探测
         nowName.setText(c.name);
@@ -908,10 +1302,39 @@ public class MainActivity extends Activity {
             ui.post(() -> startPlayback(c));
             return;
         }
+
+        // ---- 快路径一：记忆线路直接起播 ----
+        int remembered = indexOfUrl(c, SourceMemory.get(this, c.name));
+        if (remembered >= 0 && !Boolean.TRUE.equals(c.sources.get(remembered).starved)) {
+            sourceIndex = remembered;
+            final int token = playToken;
+            startPlayback(c);
+            // 背景探测只用来"发现更好的线路"，不阻塞起播
+            refineSourceInBackground(c, token);
+            return;
+        }
+
+        // ---- 快路径二：首次访问该频道，按节目单自带的 response-time 起播 ----
+        //
+        // 节目单里每条线路都带源站实测的响应耗时，解析时已按它从小到大排好，
+        // 第 0 条通常就是最快的可用线路。原来这里要等 SourceProber 探完
+        // （总预算 4.5 秒）才肯起播，这就是"每次换台都要重新加载一遍"的来源。
+        // 现在直接起播，探测退到后台精修；真起不来由起播看门狗兜底。
+        int quickest = quickestSource(c);
+        if (quickest >= 0) {
+            sourceIndex = quickest;
+            final int token = playToken;
+            startPlayback(c);
+            refineSourceInBackground(c, token);
+            return;
+        }
+
+        // ---- 慢路径：节目单没给任何线索，才阻塞探测 ----
         final int want = sourceIndex;
+        final int token = playToken;
         SourceProber.pick(this, c, want, picked -> {
             // 探测期间用户可能已经换台，旧结果直接丢弃
-            if (current != index) {
+            if (token != playToken || current != index) {
                 return;
             }
             if (picked < 0) {
@@ -923,6 +1346,63 @@ public class MainActivity extends Activity {
         });
     }
 
+    /**
+     * 按节目单的 response-time 挑最快的未标记线路。
+     *
+     * <p>解析时已按响应耗时升序排过，所以顺序扫第一个可用的即可。
+     * 全部被标记喂不饱时返回 -1，交给上层阻塞探测（它会清标记重试）。
+     */
+    private static int quickestSource(Channel c) {
+        for (int i = 0; i < c.sources.size(); i++) {
+            if (!Boolean.TRUE.equals(c.sources.get(i).starved)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * 起播后的后台精修：探测所有线路，只有明显更好才静默切换。
+     *
+     * <p>快路径用的是节目单线索，未必是最优线路。这里在后台探一遍：
+     * 还没出画面时用低门槛（换线没成本），已出画面时用高门槛
+     * （避免"看着好好的突然黑一下"）。
+     */
+    private void refineSourceInBackground(Channel c, int token) {
+        final int playing = sourceIndex;
+        final String playingUrl = c.url(playing);
+        final boolean struggling = !hasPlayed;
+        SourceProber.pickBetter(this, c, playing, struggling, better -> {
+            if (token != playToken || current < 0 || current >= channels.size()) {
+                return;
+            }
+            if (better < 0 || better == playing) {
+                return;
+            }
+            // 正在播放的线路已经换了就不要用这份结果覆盖
+            if (!playingUrl.equals(channels.get(current).url(sourceIndex))) {
+                return;
+            }
+            android.util.Log.i("IPTVPLAY", "refine " + playing + " -> " + better + " " + c.name);
+            sourceIndex = better;
+            renderInfoBar(c);
+            startPlayback(c);
+        });
+    }
+
+    /** 在频道里找某条线路的下标，找不到返回 -1。 */
+    private static int indexOfUrl(Channel c, String url) {
+        if (url == null || url.isEmpty()) {
+            return -1;
+        }
+        for (int i = 0; i < c.sources.size(); i++) {
+            if (url.equals(c.sources.get(i).url)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
     /** 真正起播：此时源已确认可达。预览模式下只刷新界面。 */
     private void startPlayback(Channel c) {
         if (player == null) {
@@ -930,10 +1410,22 @@ public class MainActivity extends Activity {
             renderInfoBar(c);
             return;
         }
+        // 换了一条新流：清掉视频渲染器的显示时间基准，
+        // 否则新流 PTS 从头开始，会被判成"重复帧"整段丢掉（换台后长时间不动）
+        PlaybackTuning.resetStreamState();
+        // 新管线的时间轴也是全新的，静默卡死检测必须重新起算，
+        // 否则换源瞬间的位置落差会被当成长时间停滞
+        stallDetector.reset();
+        // 帧率采样也重新起算，否则换源那一跳会被算成一次帧率突变
+        lastFrameAt = 0L;
+        lastFrameCount = -1;
+        lastAudioCount = -1;
         player.setMediaItem(PlaybackTuning.liveItem(c.url(sourceIndex)));
         player.prepare();
         player.setPlayWhenReady(true);
         renderInfoBar(c);
+        // 每次起播都重新计时：超时还没出画面就说明这条线路喂不饱
+        armStartupWatchdog();
     }
 
     /** 底部信息条：logo + 频道名 + 分辨率胶囊，点胶囊即换到该清晰度的线路。 */
@@ -1111,6 +1603,8 @@ public class MainActivity extends Activity {
         final Channel c = channels.get(current);
         final int failed = sourceIndex;
         final int index = current;
+        // 失败线路不能再当"记忆线路"，否则下次换台还会先踩一次坑
+        SourceMemory.remove(this, c.name);
         loading.setVisibility(View.VISIBLE);
         speed.reset();
         LiveSpeedMeter.INSTANCE.reset();
@@ -1367,6 +1861,7 @@ public class MainActivity extends Activity {
 
     private void closeDrawer() {
         drawer.setVisibility(View.GONE);
+        hidePreviewCard();
         findViewById(R.id.root).requestFocus();
         showInfoBar();
         showBar();

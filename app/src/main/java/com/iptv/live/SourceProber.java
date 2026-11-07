@@ -58,8 +58,27 @@ public final class SourceProber {
      * 真实"喂不喂得饱"由播放过程判定，见 {@code Source.starved}。
      */
     private static final long PROBE_BUDGET_MS = 2_500;
+    /**
+     * 候选很少时的采样预算。
+     *
+     * <p>纯 2.5 秒样本对慢源太乐观：实测有线路测出 569KB/s、
+     * 实际持续速率不到 100KB/s，播起来就永久缓冲。
+     * 候选多的时候靠广度取胜、每路探短；候选少时没有备胎，
+     * 宁可探久一点拿到更接近真实的读数。
+     */
+    private static final long PROBE_BUDGET_SOLO_MS = 5_000;
+    /** 候选数不超过这个值时，每路都探得更久。 */
+    private static final int FEW_CANDIDATES = 3;
     /** 所有线路一起探测的总预算，到点用已有结果，不让换台无限等。 */
     private static final long PROBE_TOTAL_MS = 4_500;
+    /**
+     * 候选很少时的总预算。
+     *
+     * <p>必须严格大于 {@link #PROBE_BUDGET_SOLO_MS}，否则探测还没跑完
+     * 就被总超时统一取消，所有结果都是 null，表现为"一个源都选不出来"。
+     * 留 2 秒余量给连接建立和调度抖动。
+     */
+    private static final long PROBE_TOTAL_SOLO_MS = PROBE_BUDGET_SOLO_MS + 2_000;
     /**
      * 速率相对码率的余量。
      * 下载和播放同时进行，等速就永远追不上。
@@ -129,6 +148,119 @@ public final class SourceProber {
         pickInternal(ctx, ch, preferred, cb, exclude);
     }
 
+    /** 播放中换线的最小收益倍数：余量要高出这么多才值得黑屏一下。 */
+    private static final double REFINE_GAIN = 1.6;
+
+    /**
+     * 后台精修：只在发现<b>明显更好</b>的线路时才回调，否则回调 -1。
+     *
+     * <p>用于"已经起播、顺便看看有没有更优线路"的场景。
+     * 回调总在主线程。
+     *
+     * <p>门槛分两档：当前线路<b>还没出画面</b>时用低门槛 {@link #REFINE_URGENT_GAIN}，
+     * 因为此时换线没有沉没成本——反正用户盯着的就是缓冲圈；
+     * 已经出画面了才用高门槛，避免"看着好好的突然黑一下"。
+     */
+    public static void pickBetter(Context ctx, Channel ch, int playing, boolean struggling,
+                                 Callback cb) {
+        final Context app = ctx.getApplicationContext();
+        POOL.execute(() -> {
+            int better = -1;
+            try {
+                better = pickBetterBlocking(app, ch, playing, struggling);
+            } catch (Exception ignored) {
+                // 精修失败无所谓，当前线路照常播
+            }
+            final int result = better;
+            MAIN.post(() -> cb.onPicked(result));
+        });
+    }
+
+    /**
+     * 当前线路还卡在起播时的换线门槛。
+     *
+     * <p>这时用户本来就在看缓冲圈，换线不会打断任何观看，
+     * 只要新线路明显更快就值得切——门槛低到 1.25 倍。
+     */
+    private static final double REFINE_URGENT_GAIN = 1.25;
+
+    private static int pickBetterBlocking(Context ctx, Channel ch, int playing,
+                                          boolean struggling) {
+        if (ch.sources.size() <= 1) {
+            return -1;
+        }
+        // 当前线路的实测速率作为基准；拿不到就放弃精修
+        Result current = probe(ch.sources.get(playing).url);
+        if (current == null) {
+            return -1;
+        }
+        double base = score(current);
+        double gainNeeded = struggling ? REFINE_URGENT_GAIN : REFINE_GAIN;
+
+        CompletionService<Result> results = new ExecutorCompletionService<>(POOL);
+        List<Future<Result>> probing = new ArrayList<>();
+        List<Integer> probeIndex = new ArrayList<>();
+        int candidates = 0;
+        for (int i = 0; i < ch.sources.size(); i++) {
+            if (i == playing || Boolean.TRUE.equals(ch.sources.get(i).starved)) {
+                continue;
+            }
+            final int idx = i;
+            candidates++;
+            probing.add(results.submit(() -> probe(ch.sources.get(idx).url)));
+            probeIndex.add(i);
+        }
+        if (candidates == 0) {
+            return -1;
+        }
+
+        Result best = null;
+        int bestIdx = -1;
+        long deadline = System.currentTimeMillis() + PROBE_TOTAL_MS;
+        try {
+            for (int k = 0; k < candidates; k++) {
+                long left = deadline - System.currentTimeMillis();
+                if (left <= 0) {
+                    break;
+                }
+                Future<Result> f = results.poll(left, TimeUnit.MILLISECONDS);
+                if (f == null) {
+                    break;
+                }
+                int pos = probing.indexOf(f);
+                Result r = f.get();
+                if (pos < 0 || r == null) {
+                    continue;
+                }
+                int idx = probeIndex.get(pos);
+                if (!r.usable() || !r.playableVideo()) {
+                    continue;
+                }
+                if (better(r, best)) {
+                    best = r;
+                    bestIdx = idx;
+                }
+            }
+        } catch (Exception ignored) {
+            // 打断就退回已有结果
+        } finally {
+            for (Future<Result> f : probing) {
+                f.cancel(true);
+            }
+        }
+
+        if (bestIdx < 0) {
+            return -1;
+        }
+        double gain = score(best) / Math.max(base, 0.01);
+        android.util.Log.i("IPTVPROBE", "refine ch=" + ch.name + " base="
+                + String.format("%.2f", base) + " best=" + bestIdx + " score="
+                + String.format("%.2f", score(best)) + " gain=" + String.format("%.2f", gain)
+                + " need=" + String.format("%.2f", gainNeeded));
+        // 收益不够大就不折腾，换线是有代价的
+        return gain >= gainNeeded ? bestIdx : -1;
+    }
+
     private static void pickInternal(Context ctx, Channel ch, int preferred, Callback cb,
                                      int exclude) {
         final Context app = ctx.getApplicationContext();
@@ -145,6 +277,15 @@ public final class SourceProber {
             return exclude == 0 ? -1 : 0;
         }
 
+        // 候选少的时候没有备胎，每路都探久一点，读数更接近真实持续速率
+        int alive = 0;
+        for (int i = 0; i < n; i++) {
+            if (i != exclude && !Boolean.TRUE.equals(ch.sources.get(i).starved)) {
+                alive++;
+            }
+        }
+        final long budget = alive <= FEW_CANDIDATES ? PROBE_BUDGET_SOLO_MS : PROBE_BUDGET_MS;
+
         CompletionService<Result> results = new ExecutorCompletionService<>(POOL);
         List<Future<Result>> probing = new ArrayList<>();
         List<Integer> probeIndex = new ArrayList<>();
@@ -159,7 +300,7 @@ public final class SourceProber {
             }
             final int idx = i;
             candidates++;
-            probing.add(results.submit(() -> probe(ch.sources.get(idx).url)));
+            probing.add(results.submit(() -> probe(ch.sources.get(idx).url, budget)));
             probeIndex.add(i);
         }
         if (candidates == 0) {
@@ -174,7 +315,7 @@ public final class SourceProber {
                 }
                 final int idx = i;
                 candidates++;
-                probing.add(results.submit(() -> probe(ch.sources.get(idx).url)));
+                probing.add(results.submit(() -> probe(ch.sources.get(idx).url, budget)));
                 probeIndex.add(i);
             }
         }
@@ -188,7 +329,9 @@ public final class SourceProber {
         // 降级候选：不满足码率余量、但至少能连上播得动的线路
         Result fallback = null;
         int fallbackIdx = -1;
-        long deadline = System.currentTimeMillis() + PROBE_TOTAL_MS;
+        // 总预算必须盖得住单路预算，否则探测会被统一取消、结果全是 null
+        long total = alive <= FEW_CANDIDATES ? PROBE_TOTAL_SOLO_MS : PROBE_TOTAL_MS;
+        long deadline = System.currentTimeMillis() + total;
         try {
             for (int k = 0; k < candidates; k++) {
                 long left = deadline - System.currentTimeMillis();
@@ -220,9 +363,9 @@ public final class SourceProber {
                         bestIdx = idx;
                     }
                 } else if (r.playableVideo() && r.speed > 0) {
-                    // 记下"能播但喂不饱"里最好的一路，全部不达标时兜底，
+                    // 记下"能播但喂不饱"里最可能出画面的一路，全部不达标时兜底，
                     // 宁可偶尔卡一下也不能黑屏
-                    if (better(r, fallback)) {
+                    if (betterFallback(r, fallback)) {
                         fallback = r;
                         fallbackIdx = idx;
                     }
@@ -293,6 +436,38 @@ public final class SourceProber {
     }
 
     /**
+     * 兜底候选的比较：优先"最可能真的出画面"，而不是分数最高。
+     *
+     * <p>实测教训：某频道只有两条线路，实测 241KB/s 和 569KB/s，
+     * 需求都是 1074KB/s，两条都远不够。原逻辑按分数取了 569KB/s 那条
+     * （score 0.53），结果起播后一直停在缓冲、永远出不来画面。
+     *
+     * <p>所以兜底不追速度，而追<b>出画面的概率</b>：
+     * 码率需求低意味着分片小、同样带宽下攒得更快，起播成功率更高。
+     */
+    private static boolean betterFallback(Result r, @Nullable Result best) {
+        if (best == null) {
+            return true;
+        }
+        boolean rOk = r.playableVideo();
+        boolean bestOk = best.playableVideo();
+        if (rOk != bestOk) {
+            return rOk;
+        }
+        boolean rAac = r.audio == TsAudio.Kind.AAC;
+        boolean bestAac = best.audio == TsAudio.Kind.AAC;
+        if (rAac != bestAac) {
+            return rAac;
+        }
+        long rNeed = r.need > 0 ? r.need : FALLBACK_NEED;
+        long bNeed = best.need > 0 ? best.need : FALLBACK_NEED;
+        if (rNeed != bNeed) {
+            return rNeed < bNeed;
+        }
+        return r.speed > best.speed;
+    }
+
+    /**
      * 量一路流的实测速率，并算出它需要多少码率。
      *
      * <p>播放列表本身只有几百字节，量不出带宽，必须下载真实分片；
@@ -300,6 +475,11 @@ public final class SourceProber {
      * 长度从 GET 响应头直接读，不发额外请求。
      */
     private static Result probe(String url) {
+        return probe(url, PROBE_BUDGET_MS);
+    }
+
+    /** 指定采样预算的探测；候选很少时用更长的预算拿到真实速率。 */
+    private static Result probe(String url, long budgetMs) {
         HttpURLConnection conn = null;
         try {
             String target = url;
@@ -345,7 +525,7 @@ public final class SourceProber {
             long total = 0;
             byte[] head = new byte[HEAD_BYTES];
             int headLen = 0;
-            long budgetEnd = start + PROBE_BUDGET_MS;
+            long budgetEnd = start + budgetMs;
             while (System.currentTimeMillis() < budgetEnd && total < PROBE_BYTES) {
                 int got = in.read(buf);
                 if (got <= 0) {

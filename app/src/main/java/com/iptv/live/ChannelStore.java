@@ -18,15 +18,22 @@ import java.util.List;
 /** 频道数据仓库：本地缓存 + 多镜像拉取刷新。 */
 public final class ChannelStore {
 
-    /** 默认数据源：best-fan 实时节目单，条目自带 [1080]/[720]/[576] 清晰度标记。 */
+    /**
+     * 默认数据源：mzky/checklist 的实时节目单。
+     *
+     * <p>条目自带 {@code response-time}（源站实测响应耗时）和 {@code tvg-logo}，
+     * 同一频道通常挂 9~18 条线路，选源时有充足的备胎；
+     * 比原先的 best-fan 清单线路更多、更新更勤。
+     */
     public static final String DEFAULT_SOURCE =
-            "https://raw.githubusercontent.com/best-fan/iptv-sources/main/cn_all_status.m3u8";
+            "https://cdn.jsdelivr.net/gh/mzky/checklist@master/itvlist.m3u";
 
     /** 按顺序尝试的远程源，前一个失败自动换下一个。 */
     private static final String[] DEFAULT_SOURCES = {
+            "https://cdn.jsdelivr.net/gh/mzky/checklist@master/itvlist.m3u",
+            "https://raw.githubusercontent.com/mzky/checklist/master/itvlist.m3u",
+            "https://gh-proxy.com/https://raw.githubusercontent.com/mzky/checklist/master/itvlist.m3u",
             "https://cdn.jsdelivr.net/gh/best-fan/iptv-sources@main/cn_all_status.m3u8",
-            DEFAULT_SOURCE,
-            "https://gh.bravetimes.cn/https://raw.githubusercontent.com/best-fan/iptv-sources/main/cn_all_status.m3u8",
     };
 
     private static final String CACHE = "channels.m3u8";
