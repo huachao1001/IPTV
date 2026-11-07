@@ -76,9 +76,15 @@ public final class PlaylistParser {
             }
             if (!dup) {
                 Channel.Source s = new Channel.Source(line);
-                // 清晰度优先取 tvg-name 标记，其次是频道名里的 (1080p)，最后从 URL 猜
+                // 档位只认可信来源：tvg-name 的 [1080] 标记，其次频道名里的 (720p)。
+                // URL 里出现 hd/1080 只是线索（很多老机房的路径凑巧带 hd），
+                // 不足以决定档位——它会影响清晰度上限，猜错就会把能播的线路挡掉。
+                // 所以 URL 猜测只写 measured，供显示和同档内排序。
                 s.quality = pendingQuality != null ? pendingQuality
-                        : qualityFromName(pendingName, qualityFromUrl(line));
+                        : qualityFromName(pendingName, null);
+                if (s.untagged()) {
+                    s.measured = qualityFromUrl(line);
+                }
                 s.responseMs = pendingMs;
                 ch.sources.add(s);
             }

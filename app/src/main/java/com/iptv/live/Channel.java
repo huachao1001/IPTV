@@ -10,8 +10,22 @@ public class Channel {
     /** 一路流：播放地址 + 已知清晰度。 */
     public static class Source {
         public final String url;
-        /** 解析出或实测到的清晰度，如 1080P；未知为空。 */
+        /**
+         * 节目单声明的清晰度（如 {@code [1080]} 标签），购选源/排序/清晰度上限都用它。
+         *
+         * <p><b>它必须稳定。</b>一旦被实测值改写，{@link QualityCap} 依据的档位
+         * 就跟着漂移，降档的「上限」会失效或误判，表现为画面来回切。
+         * 所以实测结果只写 {@link #measured}，不碰这个字段。
+         */
         public String quality;
+        /**
+         * 实测到的清晰度（解码器真正输出的高度）。
+         *
+         * <p>只用于界面显示和"无标签线路"之间的排序，<b>不参与</b>档位判定：
+         * 节目单没给标记的线路档位恒为 0，这样"只允许无标记线路"的上限
+         * （{@code cap=0}）在实测之后依然成立，不会因为测出 576 就把自己排除掉。
+         */
+        public String measured;
         /** 源文件里记录的响应耗时，0 表示未知。 */
         public int responseMs;
 
@@ -29,9 +43,54 @@ public class Channel {
             this.url = url;
         }
 
-        /** 界面上显示的清晰度文字，未知时显示"自动"。 */
+        /** 界面上显示的清晰度文字：优先节目单标记，其次实测，都没有显示"自动"。 */
         public String label() {
-            return quality == null || quality.isEmpty() ? "自动" : quality;
+            if (quality != null && !quality.isEmpty()) {
+                return quality;
+            }
+            if (measured != null && !measured.isEmpty()) {
+                return measured;
+            }
+            return "自动";
+        }
+
+        /**
+         * 参与选源/上限判定的有效档位。
+         *
+         * <p><b>只认节目单标记，绝不掺实测值。</b>实测值写进独立的
+         * {@link #measured}，只用于界面显示和同档内排序。
+         *
+         * <p>这一点必须守住，否则上限会自己失效：节目单没给标记的线路
+         * 档位恒为 0，而"降到底档"的上限正是 {@code 0}。一旦让实测值参与，
+         * 一条无标记线路播过一次、被测成 576P，它的档位就变成 576，
+         * 立刻被 {@code cap=0} 排除掉——明明是<b>允许</b>的线路却消失了。
+         * 真机实测（build/final_grace.log 14:59:00）正是这样：
+         * <pre>
+         *   qual[src=1080P cap=0]   ← 未标记线路测出 1080P 后仍被选中
+         *   startup-timeout buffered=0   ← 结果它根本喂不动
+         * </pre>
+         *
+         * <p>实测值未知时返回 0，表示"确实不知道"，仍允许兜底选用。
+         */
+        public int effectiveRank() {
+            return Channel.rank(quality);
+        }
+
+        /** 节目单没给清晰度标记。这类线路档位视为 0，是最低档的兜底。 */
+        public boolean untagged() {
+            return quality == null || quality.isEmpty();
+        }
+
+        /**
+         * 界面展示用的清晰度键：有标记用标记，否则用实测值，都没有返回空串。
+         *
+         * <p>只用于信息条的胶囊分组，不影响 {@link #quality} 的档位语义。
+         */
+        public String displayKey() {
+            if (quality != null && !quality.isEmpty()) {
+                return quality;
+            }
+            return measured == null ? "" : measured;
         }
     }
 
@@ -77,6 +136,9 @@ public class Channel {
      * <p>换台时直接用第 0 条起播，响应越快的线路出画面越快。
      * 没有清晰度标记的线路（rank 相同）之间也按响应耗时排，
      * 这样"最快可播"永远是第一条。
+     *
+     * <p>实测分辨率只作为<b>同档内</b>的次级排序依据：它是事实，
+     * 比猜测可信，但绝不能越级盖过节目单的声明档位。
      */
     public void sortBySpeed() {
         Collections.sort(sources, (a, b) -> {
@@ -84,6 +146,12 @@ public class Channel {
             int qb = rank(b.quality);
             if (qa != qb) {
                 return qb - qa;
+            }
+            // 同为无标记（或同档）时，实测分辨率高的排前面
+            int ma = rank(a.measured);
+            int mb = rank(b.measured);
+            if (ma != mb) {
+                return mb - ma;
             }
             int ra = a.responseMs > 0 ? a.responseMs : Integer.MAX_VALUE;
             int rb = b.responseMs > 0 ? b.responseMs : Integer.MAX_VALUE;

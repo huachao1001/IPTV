@@ -153,6 +153,107 @@ public class MainActivity extends Activity {
     /** 中途卡顿的起始时刻，0 表示当前没在卡。 */
     private long rebufferStart = 0L;
 
+    /**
+     * 本次播放已经因为「喂不饱」降过档，不再重复降。
+     *
+     * <p>降档要走"标记 → 重挑 → 换线"，一轮就要几秒黑屏。
+     * 同一次播放里反复降会变成连续黑屏，所以只降一次；
+     * 真降不下来再交给看门狗，而不是继续在这里换档。
+     */
+    private boolean qualityLoweredThisSession = false;
+    /**
+     * 降档的冷却时间。
+     *
+     * <p>刚降下去时新线路正要开始缓冲，此时 {@code STATE_BUFFERING}
+     * 还会被记一次卡顿，如果不加冷却就会立刻再降一档，
+     * 一路降到 576 —— 用户会觉得"越看越糊"。
+     */
+    private long lastQualityLowerAt = 0L;
+    private static final long QUALITY_LOWER_COOLDOWN_MS = 30_000L;
+
+    /**
+     * 用户手动选过清晰度之后，一段时间内<b>不许自动降档</b>。
+     *
+     * <p>用户点 1080 说明他明确想看高清。若两秒后因为一次起播缓冲就自动
+     * 降到 720，他会觉得"点了没反应"甚至"跟我对着干"。所以给一段
+     * 观察期：这段时间内自动降档完全禁用，让用户自己判断要不要换回去。
+     *
+     * <p>观察期过后恢复正常：真喂不动还是会降，否则就等于把用户锁在
+     * 一个永远卡的画面里。这段时间也给新线路留出攒够缓冲的机会——
+     * 1080 的缓冲本来就是边播边耗，头十几秒的缓冲不代表喂不动。
+     */
+    private static final long MANUAL_PICK_GRACE_MS = 90_000L;
+    /** 用户最后一次手动选清晰度的时刻，0 表示本次会话没手动选过。 */
+    private long lastManualPickAt = 0L;
+    /**
+     * 手动选清晰度发生在<b>哪个频道</b>。
+     *
+     * <p>必须绑定频道名：观察期的意思是"别打断这个台的观看"，
+     * 不是"全局 90 秒不允许换线"。否则用户在 A 台点了高清，
+     * 马上换到 B 台，B 台的自动降档和精修也会被一起冻住——
+     * B 台可能本来就喂不动，却因为 A 台的操作一直卡着。
+     */
+    private String manualPickChannel = null;
+    /**
+     * 手动选中的这条线路连续起不来的次数。
+     *
+     * <p>观察期内不能无限容忍黑屏：用户点 1080 之后若每次都超时，
+     * 只能降档救场。但第一次超时先给同一条线路再试一次——
+     * 起播慢七八秒在高码率源上很常见，一次超时就降档等于"点了没用"。
+     */
+    private int manualGraceStrikes = 0;
+    /** 观察期内允许重开同一条线路的次数。 */
+    private static final int MANUAL_GRACE_STRIKES = 1;
+
+    /**
+     * 当前是否处于"用户刚手动选过清晰度"的观察期。
+     *
+     * @param channel 正在判断的频道名
+     */
+    private boolean inManualGrace(String channel) {
+        if (lastManualPickAt <= 0 || channel == null) {
+            return false;
+        }
+        if (manualPickChannel != null && !manualPickChannel.equals(channel)) {
+            return false;
+        }
+        return System.currentTimeMillis() - lastManualPickAt < MANUAL_PICK_GRACE_MS;
+    }
+
+    /**
+     * 已经出画面之后，又开始重新缓冲的次数统计。
+     *
+     * <p><b>这是"喂不饱"最直接的证据，也是最常被漏掉的一种。</b>
+     * 实测 1080 那条线路（{@code 222.223.41.27}，需求约 1.0 MB/s，
+     * 本机只能拿到 0.42~0.54 MB/s）不会报错、也不会跳分片，
+     * 它的形态是：出画面 → 播七八秒缓冲耗尽 → 缓冲 → 再播 → 再缓冲，
+     * 45 次采样里 17 次落在 {@code state=2}。
+     *
+     * <p>其它三条判据都盖不住这种：
+     * <ul>
+     *   <li>起播看门狗只管"还没出过画面"；</li>
+     *   <li>{@code STARVED_SKIP_LIMIT} 要看分片跳号，而它每次只晚了不到一片；</li>
+     *   <li>静默卡死看的是 READY 下画面不动，而它是在缓冲和播放之间来回。</li>
+     * </ul>
+     * 所以在同一段时间内反复进入缓冲，就该降档了。
+     */
+    private int rebufferCount = 0;
+    /** 本轮统计的起始时刻，0 表示还没开始计。 */
+    private long rebufferWindowAt = 0L;
+    /** 多少秒内反复缓冲就判定喂不动。太短会把正常的换线缓冲也算进来。 */
+    private static final long REBUFFER_WINDOW_MS = 90_000L;
+    /** 窗口内缓冲几次算喂不动。1080 实测是每 5~8 秒一次，2 次太少会误判。 */
+    private static final int REBUFFER_LIMIT = 3;
+    /**
+     * 上一次真正开始播放的地址，用来判断"是不是换了新流"。
+     *
+     * <p>反复缓冲的计数<b>只能在新流上清零</b>。同一个地址被看门狗重开时
+     * 若也清零，那"一直喂不动、反复被重开"的线路永远攒不到阈值——
+     * 实测 CCTV-9 的 1080 就是这样：缓冲 18 秒 → 播 4 秒 → 又缓冲 → 被重开，
+     * 计数器每次归零，直到起播看门狗超时才降档。
+     */
+    private String lastStartedUrl = null;
+
     private final Handler ui = new Handler(Looper.getMainLooper());
     /** 分片下载速率，缓冲时显示给用户看。 */
     private final LoadSpeedMeter speed = new LoadSpeedMeter();
@@ -288,16 +389,19 @@ public class MainActivity extends Activity {
     private int startupFailures = 0;
 
     /**
-     * 静默卡死检测：状态是 READY、也"在播"，但播放时钟不再前进。
+     * 静默卡死检测：状态是 READY、也「在播」，但画面其实不再更新。
      *
-     * <p>现有两个看门狗都盖不住这种形态——起播看门狗只管"还没出过画面"，
-     * 卡顿看门狗只在 STATE_BUFFERING 下启动。一旦停在 READY 而时钟不走，
-     * 日志里表现为 {@code state=3 pos=-42917} 一路往负方向滑、画面永久定格，
+     * <p>现有两个看门狗都盖不住这种形态——起播看门狗只管「还没出过画面」，
+     * 卡顿看门狗只在 STATE_BUFFERING 下启动。一旦停在 READY 而画面不动，
      * 两个看门狗都不触发，只能靠用户手动换台。
      *
-     * <p>判定逻辑见 {@link StallDetector}：只有位置"严格向前"才算进展，
-     * 因为直播位置在分片滑出窗口时会整体后退（实测每 5 秒退 5000ms），
-     * 把"变了"当成"在走"就永远检测不到。
+     * <p>判定逻辑见 {@link StallDetector}，同时看两个口径：
+     * <ul>
+     *   <li><b>位置</b>：只有「严格向前」才算进展，因为直播位置在分片滑出
+     *       窗口时会整体后退（实测每 5 秒退 5000ms）；</li>
+     *   <li><b>帧数</b>：位置照走但画面不动也能抓到。实测确实出现过
+     *       {@code pos 一路前进、fps 却归零 3.5 秒} 的形态，只看位置必然漏检。</li>
+     * </ul>
      */
     private final StallDetector stallDetector = new StallDetector();
     /** 静默卡死的检测间隔。 */
@@ -319,7 +423,15 @@ public class MainActivity extends Activity {
                         == Player.PLAYBACK_SUPPRESSION_REASON_NONE
                         && p.getPlayerError() == null;
                 long now = System.currentTimeMillis();
-                if (stallDetector.sample(eligible, p.getCurrentPosition(), now)) {
+                // 帧数取已渲染输出数：位置照走而画面停住的那种停帧，
+                // 只有这个计数能反映出来。
+                long frames = -1L;
+                androidx.media3.exoplayer.DecoderCounters vc = p.getVideoDecoderCounters();
+                if (vc != null) {
+                    vc.ensureUpdated();
+                    frames = vc.renderedOutputBufferCount;
+                }
+                if (stallDetector.sample(eligible, p.getCurrentPosition(), frames, now)) {
                     onSilentStall(p);
                 }
             }
@@ -328,11 +440,21 @@ public class MainActivity extends Activity {
     };
 
     /**
-     * 状态 READY 但时钟停走：重开这一路流。
+     * 状态 READY、位置也在走，但画面长时间不出新帧：重建这一路播放管线。
      *
-     * <p>不解码器/音频渲染器卡死时，seek 和等待都没用，只有重建播放管线
-     * 才能恢复（与 xplayer 的处理一致：位置停 6 秒就重连，连续两次还卡
-     * 就换一条解码管线）。这里先重开同一路；连续多次仍卡才换线。
+     * <p><b>绝不能用 {@code seekToDefaultPosition()} 来恢复。</b>
+     * 直播流的默认位置是<b>窗口起点</b>，实测
+     * {@code old=16557 new=0 buffered=0}——等于往回跳 16.5 秒，
+     * 用户当场看到刚看过的内容重播一遍（正是「重复播放」这个症状本身），
+     * 而且缓冲被清空后只能从 467ms 重新攒，恢复反而更慢。
+     *
+     * <p>更麻烦的是 {@link LiveVideoRenderer} 有意不在
+     * {@link androidx.media3.exoplayer.video.MediaCodecVideoRenderer#onPositionReset}
+     * 里重建 PTS 高水位线（否则任何回跳都会变成整段重播）。回跳后每一帧都低于
+     * 基准，全被判成重复帧丢掉，画面要冻到 60 秒兜底才恢复——雪上加霜。
+     *
+     * <p>所以恢复动作只有一种：重开同一路。它会把解码器和新时间轴一起重建，
+     * 并且落在直播边缘附近（{@code TARGET_OFFSET_MS}），不会重播任何内容。
      */
     private void onSilentStall(ExoPlayer p) {
         if (current < 0 || current >= channels.size()) {
@@ -341,6 +463,8 @@ public class MainActivity extends Activity {
         Channel c = channels.get(current);
         android.util.Log.w("IPTVSTALL", "silent-stall ch=" + c.name
                 + " pos=" + p.getCurrentPosition()
+                + " posStalledMs=" + stallDetector.lastTriggerPosMs()
+                + " frameStalledMs=" + stallDetector.lastTriggerFrameMs()
                 + " buffered=" + p.getTotalBufferedDuration()
                 + " round=" + (silentStallRounds + 1));
         stallDetector.reset();
@@ -354,7 +478,11 @@ public class MainActivity extends Activity {
             return;
         }
         if (silentStallRounds >= 2) {
-            // 重开同一路救不回来，多半是这条线路的问题，换一条
+            // 重开同一路救不回来，多半是这条线路（或这个码率）喂不动。
+            // 先降一档清晰度；降不下来才换同档的另一条线路。
+            if (lowerQualityInstead(c, "silent-stall")) {
+                return;
+            }
             repickSource();
             return;
         }
@@ -404,7 +532,35 @@ public class MainActivity extends Activity {
             SourceMemory.remove(MainActivity.this, c.name);
             startupFailures++;
             if (startupFailures >= STARTUP_GIVE_UP_ROUNDS) {
-                // 这个台的线路全都不行，别再耗下去，把状态清干净等用户换台
+                // 这个台的线路全都不行，别再耗下去。
+                //
+                // 但在放弃之前先看看是不是<b>清晰度上限把好线路挡掉了</b>。
+                // 上限一旦落到某个低档（或历史上被写坏成 0），超出它的线路
+                // 就全部不参与选源；若恰好那档线路都喂不动，这个台就会
+                // 永远起不来。上限还会写进 quality_cap.xml 保留 3 小时，
+                // 于是问题会跨越多次启动一直存在
+                // （真机实测 build/final_grace.log 14:59:15：cap=0 之后三路全超时）。
+                //
+                // 所以放弃判定必须能让上限失效：清掉它再重来一轮，
+                // 让播放器重新在所有线路上找，而不是被一个旧结论永久困住。
+                // 这层兜底与 nextLower() 无关——那里已经不退到 0 了，
+                // 但历史落盘的数据、以及未来任何新的降档逻辑出错，都要靠它自愈。
+                if (QualityCap.capRank(MainActivity.this, c.name) != Integer.MAX_VALUE) {
+                    android.util.Log.w("IPTVQUAL", "give-up releases cap ch=" + c.name
+                            + " cap=" + QualityCap.capRank(MainActivity.this, c.name));
+                    QualityCap.clear(MainActivity.this, c.name);
+                    // 连带把"喂不饱"标记也清掉：那些标记很可能是在低档上
+                    // 被反复超时的线路留下的，放开上限后要重新给它们机会
+                    for (Channel.Source src : c.sources) {
+                        src.starved = null;
+                    }
+                    startupFailures = 0;
+                    retryRound = 0;
+                    // 放开上限后重新挑，而不是继续降——降档正是刚才把
+                    // 可播线路排除掉的原因，再降只会更没得选
+                    repickSource();
+                    return;
+                }
                 android.util.Log.w("IPTVSTALL", "give up ch=" + c.name
                         + " after " + startupFailures + " tries");
                 startupFailures = 0;
@@ -414,9 +570,62 @@ public class MainActivity extends Activity {
                 return;
             }
             retryRound = 0;
+            // 起播超时同样是"喂不动"的证据：7 秒还没攒够能出画面的数据，
+            // 对 1080 这种 1 MB/s 的流很典型。先降一档，别急着换同档备胎。
+            //
+            // 但用户刚手动选了这条清晰度时，先别急着否定他的选择：
+            // 起播慢七八秒在高码率源上很常见，第一次超时重开同一条线路再给
+            // 一个周期，第二次还出不来才降档。否则"点了 1080 → 7 秒后自动
+            // 变 720"，用户只会觉得这个按钮没用。
+            if (inManualGrace(c.name) && manualGraceStrikes < MANUAL_GRACE_STRIKES) {
+                manualGraceStrikes++;
+                android.util.Log.w("IPTVSTALL", "startup-timeout retry-same ch=" + c.name
+                        + " strike=" + manualGraceStrikes + "/" + MANUAL_GRACE_STRIKES);
+                startPlayback(c);
+                return;
+            }
+            if (lowerQualityInstead(c, "startup-timeout")) {
+                return;
+            }
             repickSource();
         }
     };
+
+    /**
+     * 记录一次"看着看着又卡了"，窗口内次数到阈值就降一档。
+     *
+     * <p>只统计<b>已经出过画面之后</b>的缓冲：起播时攒缓冲是正常流程，
+     * 把它算进去会导致一进台就误判。
+     *
+     * <p>降不了档（已降过 / 冷却中 / 已是最低档）时只留下日志，
+     * 不打断播放——反复缓冲虽然难受，也好过把能看的画面打断。
+     */
+    private void noteRebuffer() {
+        if (current < 0 || current >= channels.size()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (rebufferWindowAt == 0 || now - rebufferWindowAt > REBUFFER_WINDOW_MS) {
+            // 换了一个新窗口：上一轮的计数不算数了
+            rebufferWindowAt = now;
+            rebufferCount = 0;
+        }
+        rebufferCount++;
+        if (rebufferCount < REBUFFER_LIMIT) {
+            return;
+        }
+        rebufferCount = 0;
+        rebufferWindowAt = now;
+        Channel c = channels.get(current);
+        android.util.Log.w("IPTVSTALL", "rebuffer-heavy ch=" + c.name
+                + " times=" + REBUFFER_LIMIT
+                + " in=" + (REBUFFER_WINDOW_MS / 1000) + "s"
+                + " qual=" + c.source(sourceIndex).label());
+        if (lowerQualityInstead(c, "rebuffer-heavy")) {
+            return;
+        }
+        // 降不下来就别再反复评估了，等下一个窗口
+    }
 
     /** 当前这轮起播的起始时刻。 */
     private long startupAt = 0L;
@@ -431,6 +640,9 @@ public class MainActivity extends Activity {
         ui.removeCallbacks(startupWatchdog);
         // 出画面了就说明这个台是好的，失败计数归零
         startupFailures = 0;
+        // 手动选中那条线路已经出画面，观察期内的重试额度也用不上了，
+        // 下次手动选台重新从 0 起算
+        manualGraceStrikes = 0;
     }
 
     /**
@@ -490,11 +702,18 @@ public class MainActivity extends Activity {
                         + " skips=" + chunkSkips);
                 if (chunkSkips >= STARVED_SKIP_LIMIT
                         && current >= 0 && current < channels.size()) {
-                    Channel.Source s = channels.get(current).source(sourceIndex);
+                    Channel ch = channels.get(current);
+                    Channel.Source s = ch.source(sourceIndex);
                     s.starved = Boolean.TRUE;
                     android.util.Log.w("IPTVLOAD", "starved url=" + s.url);
                     chunkSkips = 0;
                     lastChunkSeq = seq;
+                    // 这条线路喂不动：先降一档清晰度再重挑。
+                    // 分片跳号是带宽不足的铁证，而同机房同码率的备胎往往一样卡，
+                    // 单纯换线解决不了根本问题。
+                    if (lowerQualityInstead(ch, "chunk-jump")) {
+                        return;
+                    }
                     repickSource();
                     return;
                 }
@@ -565,10 +784,11 @@ public class MainActivity extends Activity {
                 }
             }
             // 帧计数是判断"卡在管线"还是"卡在显示"的决定性依据：
-            // rendered 每秒应约等于内容的帧率（本机是 25fps 的 576i），
-            // dropped/skipped 才是真正被丢掉的帧。三者都正常却仍看着不顺，
-            // 就说明问题在显示侧（25fps 输出到 60Hz 面板的 3:2 下拉），
-            // 不是解码/网络能修的。
+            // 本机内容实测为 576i25（每个 picture 都是一场，见 field_check.py），
+            // 所以 rendered 每秒约 50（50 场/秒）。dropped/skipped 才是真正丢掉的画面。
+            // 三者都正常却仍看着不顺，问题就在显示侧：
+            // 50 场/秒 的隔行内容喂给 60Hz 面板，需要 3:2 pulldown 重新排帧，
+            // 这不是网络或解码能修的。
             String frames = "-";
             androidx.media3.exoplayer.DecoderCounters vc = player.getVideoDecoderCounters();
             if (vc != null) {
@@ -577,10 +797,11 @@ public class MainActivity extends Activity {
                 long dt = lastFrameAt == 0 ? 0 : Math.max(1, now - lastFrameAt);
                 int df = lastFrameCount < 0 ? 0 : vc.renderedOutputBufferCount - lastFrameCount;
                 double fps = dt > 0 ? df * 1000.0 / dt : 0;
-                // 帧释放迟到量：渲染器本该在某时刻送出这一帧，实际晚了多少。
-                // 稳定在毫秒级说明排期正常；一旦周期性冲到几十毫秒，
-                // 就是"看着一顿一顿"的直接证据（与平均帧率无关，平均值会掩盖它）。
-                double lateMs = vc.videoFrameProcessingOffsetCount > 0
+                // 帧提前量：media3 记的是 getEarlyUs()，正值表示这一帧
+                // 比排期时刻提前了多少送显。稳定在几十毫秒是正常的提前量；
+                // 真正的问题形态是它变成大负值（帧总是来不及），
+                // 或送显节奏被打断（帧率掉 0），平均值看不出后者。
+                double earlyMs = vc.videoFrameProcessingOffsetCount > 0
                         ? vc.totalVideoFrameProcessingOffsetUs
                         / 1000.0 / vc.videoFrameProcessingOffsetCount : 0;
                 // 音频时钟同步对照：视频排期跟着音频走，
@@ -600,7 +821,7 @@ public class MainActivity extends Activity {
                 }
                 frames = "rendered=" + vc.renderedOutputBufferCount
                         + " fps=" + String.format(Locale.US, "%.1f", fps)
-                        + " late=" + String.format(Locale.US, "%.1f", lateMs) + "ms"
+                        + " early=" + String.format(Locale.US, "%.1f", earlyMs) + "ms"
                         + " dropped=" + vc.droppedBufferCount
                         + " skipped=" + vc.skippedOutputBufferCount
                         + " " + au;
@@ -615,6 +836,7 @@ public class MainActivity extends Activity {
                     + " speed=" + player.getPlaybackParameters().speed
                     + " vol=" + player.getVolume()
                     + " frames[" + frames + "]"
+                    + " qual[" + qualityState() + "]"
                     + " url=" + (player.getCurrentMediaItem() == null ? "-"
                             : player.getCurrentMediaItem().localConfiguration.uri)
                     + " audio[" + audio + "]");
@@ -626,6 +848,29 @@ public class MainActivity extends Activity {
     private long lastFrameAt = 0L;
     private int lastFrameCount = -1;
     private int lastAudioCount = -1;
+
+    /**
+     * 当前清晰度状态，供日志判断"是否真的优先 1080、是否真的降档锁住"。
+     *
+     * <p>三条信息缺一不可：
+     * <ul>
+     *   <li>{@code cap}：这个频道的清晰度上限，{@code max} 表示没降过；</li>
+     *   <li>{@code src}：当前这条线路节目单上标的档位（实测覆盖后的值）；</li>
+     *   <li>{@code lowered}：本次会话是否已经降过档，{@code 1} 之后不会再降。</li>
+     * </ul>
+     * 降档后若 {@code src} 又变回 1080，就说明"不许弹回"的链路有漏洞。
+     */
+    private String qualityState() {
+        if (current < 0 || current >= channels.size()) {
+            return "-";
+        }
+        Channel c = channels.get(current);
+        int cap = QualityCap.capRank(this, c.name);
+        String capText = cap == Integer.MAX_VALUE ? "max" : String.valueOf(cap);
+        String src = c.source(sourceIndex).label();
+        return "src=" + src + " cap=" + capText
+                + " lowered=" + (qualityLoweredThisSession ? 1 : 0);
+    }
 
     @Override
     protected void onCreate(@Nullable Bundle bundle) {
@@ -730,6 +975,7 @@ public class MainActivity extends Activity {
                             lastBufferedAt = System.currentTimeMillis();
                             ui.removeCallbacks(stallWatchdog);
                             ui.postDelayed(stallWatchdog, STALL_POLL_MS);
+                            noteRebuffer();
                         }
                     } else if (state == Player.STATE_READY) {
                         stopBufferProgress();
@@ -970,9 +1216,44 @@ public class MainActivity extends Activity {
         return false;
     }
 
+    /**
+     * 找到 {@code v} 自己或祖先里直接挂在 {@code parent} 下的那一层。
+     *
+     * <p>{@link RecyclerView#getChildAdapterPosition(View)} 只接受直接子项，
+     * 传子孙进去会抛 {@code ClassCastException}（LayoutParams 类型不符），
+     * 而且是在焦点变化的路径上，直接崩进程。焦点可能落在行内的子 View 上，
+     * 所以必须先归一化。
+     *
+     * @return 直接子项；{@code v} 不在 {@code parent} 里时返回 null
+     */
+    @Nullable
+    private static View directChildOf(@Nullable View v, View parent) {
+        View f = v;
+        while (f != null) {
+            Object p = f.getParent();
+            if (p == parent) {
+                return f;
+            }
+            if (!(p instanceof View)) {
+                return null;
+            }
+            f = (View) p;
+        }
+        return null;
+    }
+
     /** 按聚焦的行渲染预览卡。 */
     private void previewFor(View row) {
-        int pos = list.getChildAdapterPosition(row);
+        // 焦点可能落在行内部的某个子 View 上（列表是 FOCUS_AFTER_DESCENDANTS），
+        // 而 getChildAdapterPosition 只接受 RecyclerView 的直接子项，
+        // 传子孙 View 进去会因为 LayoutParams 类型不符抛 ClassCastException 直接崩进程。
+        // 所以先往上找到真正挂在列表上的那一层。
+        View item = directChildOf(row, list);
+        if (item == null) {
+            hidePreviewCard();
+            return;
+        }
+        int pos = list.getChildAdapterPosition(item);
         if (pos < 0 || pos >= channels.size()) {
             hidePreviewCard();
             return;
@@ -1279,7 +1560,15 @@ public class MainActivity extends Activity {
         silentStallRounds = 0;
         stallDetector.reset();
         playToken++;
-
+        // 换台是全新会话：降档状态跟着重置。
+        // 但不能清 QualityCap —— 那是跨会话的结论，
+        // 清了就会在换台回来时又去撞一次已知喂不动的 1080。
+        qualityLoweredThisSession = false;
+        // 反复缓冲的统计也从零开始，别把上一路的卡顿算到新台上
+        rebufferCount = 0;
+        rebufferWindowAt = 0L;
+        // 观察期内"重开同一条线路"的额度也是每次播放独立的
+        manualGraceStrikes = 0;
         // 名字和图标立刻显示，不让用户对着黑屏等探测
         nowName.setText(c.name);
         nowMeta.setText(ChannelGroups.displayName(c.group));
@@ -1304,8 +1593,14 @@ public class MainActivity extends Activity {
         }
 
         // ---- 快路径一：记忆线路直接起播 ----
+        //
+        // 记忆线路必须再过一道清晰度上限：SourceMemory 记的是"上次真正播起来的
+        // 那条"，降档之前它可能正是已经被判定喂不动的 1080。若这里不检查，
+        // 用户切走再切回来就会又撞一次 1080、再卡、再降——正是要避免的来回切换。
         int remembered = indexOfUrl(c, SourceMemory.get(this, c.name));
-        if (remembered >= 0 && !Boolean.TRUE.equals(c.sources.get(remembered).starved)) {
+        if (remembered >= 0 && !Boolean.TRUE.equals(c.sources.get(remembered).starved)
+                && c.sources.get(remembered).effectiveRank()
+                        <= QualityCap.capRank(this, c.name)) {
             sourceIndex = remembered;
             final int token = playToken;
             startPlayback(c);
@@ -1338,6 +1633,16 @@ public class MainActivity extends Activity {
                 return;
             }
             if (picked < 0) {
+                // 一路都没挑出来：多半是清晰度上限把所有候选都挡掉了
+                // （上限落到「只允许无标记线路」而该频道一条都没有）。
+                // 这时宁可放开上限再试，也不能把用户留在永久黑屏。
+                if (QualityCap.capRank(this, c.name) != Integer.MAX_VALUE) {
+                    android.util.Log.w("IPTVQUAL", "cap leaves no candidate ch=" + c.name
+                            + ", releasing cap");
+                    QualityCap.clear(this, c.name);
+                    play(index);
+                    return;
+                }
                 loading.setVisibility(View.GONE);
                 return;
             }
@@ -1347,18 +1652,42 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * 按节目单的 response-time 挑最快的未标记线路。
+     * 挑选起播线路：<b>在允许的清晰度内取最高档，同档取响应最快的</b>。
      *
-     * <p>解析时已按响应耗时升序排过，所以顺序扫第一个可用的即可。
-     * 全部被标记喂不饱时返回 -1，交给上层阻塞探测（它会清标记重试）。
+     * <p>原来这里只取"第一个没被标记的线路"，而解析是按 response-time 升序排的，
+     * 于是永远命中那批 720×576 的小机房线路——节目单里 1080 的线路排在后面
+     * 永远轮不到。实测就是这个原因让画面一直是低清。
+     *
+     * <p>现在先读频道当前的清晰度上限（{@link QualityCap}），在不超过上限的
+     * 线路里取档位最高的一条；同档内仍按响应耗时取快的。上限就是"降档后
+     * 锁住不回升"的地方：一旦 1080 被判定喂不动，上限降到 720，
+     * 这里就不可能再挑 1080。
+     *
+     * <p>全部线路都被标记喂不饱时返回 -1，交给上层阻塞探测（它会清标记重试）。
      */
-    private static int quickestSource(Channel c) {
+    private int quickestSource(Channel c) {
+        int cap = QualityCap.capRank(this, c.name);
+        int best = -1;
+        int bestRank = -1;
         for (int i = 0; i < c.sources.size(); i++) {
-            if (!Boolean.TRUE.equals(c.sources.get(i).starved)) {
-                return i;
+            if (Boolean.TRUE.equals(c.sources.get(i).starved)) {
+                continue;
+            }
+            int r = c.sources.get(i).effectiveRank();
+            if (r > cap) {
+                continue;
+            }
+            // sources 已按（清晰度降序, response-time 升序）排过，
+            // 所以第一个最高档的就是同档里最快的
+            if (r > bestRank) {
+                bestRank = r;
+                best = i;
+                if (r == cap) {
+                    break;
+                }
             }
         }
-        return -1;
+        return best;
     }
 
     /**
@@ -1382,6 +1711,36 @@ public class MainActivity extends Activity {
             // 正在播放的线路已经换了就不要用这份结果覆盖
             if (!playingUrl.equals(channels.get(current).url(sourceIndex))) {
                 return;
+            }
+            Channel ch = channels.get(current);
+            int fromRank = ch.source(sourceIndex).effectiveRank();
+            int toRank = ch.source(better).effectiveRank();
+            // 用户刚手动点过清晰度：这段时间内不做任何静默换线。
+            // 换了线路播放器就要重建管线、画面会黑一下，
+            // 用户刚从菜单里选完清晰度就看到黑屏，会以为"点了没用"。
+            //
+            // 例外：他选的那条线路还没出过画面。此时屏幕上只有缓冲圈，
+            // 换线不会打断任何观看，反而可能救回起播——照旧冻住它只会黑屏等着。
+            if (inManualGrace(c.name) && hasPlayed) {
+                android.util.Log.i("IPTVPLAY", "refine skip-manual-grace " + playing
+                        + " -> " + better + " " + c.name);
+                return;
+            }
+            if (toRank < fromRank) {
+                // 精修把画面换低了：必须和自动降档走同一份上限，
+                // 否则下次精修又按速率把 1080 挑回来 —— 来回切就是这么来的。
+                // 只在「还没出画面」时允许这条路（此时换线没有观看代价）。
+                if (hasPlayed || fromRank <= 0) {
+                    android.util.Log.i("IPTVPLAY", "refine skip-lower " + playing
+                            + " -> " + better + " " + c.name
+                            + " from=" + fromRank + " to=" + toRank);
+                    return;
+                }
+                QualityCap.lockAt(this, ch.name, toRank);
+                qualityLoweredThisSession = true;
+                lastQualityLowerAt = System.currentTimeMillis();
+                android.util.Log.w("IPTVQUAL", "lower ch=" + c.name
+                        + " why=refine-never-played from=" + fromRank + " to=" + toRank);
             }
             android.util.Log.i("IPTVPLAY", "refine " + playing + " -> " + better + " " + c.name);
             sourceIndex = better;
@@ -1416,6 +1775,15 @@ public class MainActivity extends Activity {
         // 新管线的时间轴也是全新的，静默卡死检测必须重新起算，
         // 否则换源瞬间的位置落差会被当成长时间停滞
         stallDetector.reset();
+        // 换了一条新流，之前那一段的缓冲次数不能带过来；
+        // 但<b>同一个地址</b>被看门狗重开时不能清零 —— 否则反复喂不动的线路
+        // 永远攒不到 rebuffer-heavy 阈值。
+        String url = c.url(sourceIndex);
+        if (lastStartedUrl == null || !lastStartedUrl.equals(url)) {
+            rebufferCount = 0;
+            rebufferWindowAt = 0L;
+        }
+        lastStartedUrl = url;
         // 帧率采样也重新起算，否则换源那一跳会被算成一次帧率突变
         lastFrameAt = 0L;
         lastFrameCount = -1;
@@ -1445,7 +1813,7 @@ public class MainActivity extends Activity {
         }
 
         infoQualityRow.removeAllViews();
-        String currentLabel = c.source(sourceIndex).label();
+        String currentLabel = c.source(sourceIndex).displayKey();
 
         // 已知分辨率去重后逐个列出；还没测出分辨率的线路折叠成一个"更多线路"
         Set<String> used = new LinkedHashSet<>();
@@ -1453,20 +1821,20 @@ public class MainActivity extends Activity {
         int unknownCount = 0;
         for (int i = 0; i < c.sources.size(); i++) {
             Channel.Source s = c.sources.get(i);
-            if (s.quality == null || s.quality.isEmpty()) {
+            String key = s.displayKey();
+            if (key.isEmpty()) {
                 if (firstUnknown < 0) {
                     firstUnknown = i;
                 }
                 unknownCount++;
                 continue;
             }
-            if (!used.add(s.quality)) {
+            if (!used.add(key)) {
                 continue;
             }
-            addQualityPill(s.quality, i, s.quality.equals(currentLabel));
+            addQualityPill(key, i, key.equals(currentLabel));
         }
-        boolean onUnknown = c.source(sourceIndex).quality == null
-                || c.source(sourceIndex).quality.isEmpty();
+        boolean onUnknown = c.source(sourceIndex).displayKey().isEmpty();
         if (firstUnknown >= 0) {
             // 未知线路没有区分信息，横排一行只会变成噪音
             int target = onUnknown ? nextUnknown(c, sourceIndex) : firstUnknown;
@@ -1481,8 +1849,7 @@ public class MainActivity extends Activity {
     private static int nextUnknown(Channel c, int from) {
         for (int k = 1; k <= c.sources.size(); k++) {
             int i = (from + k) % c.sources.size();
-            Channel.Source s = c.sources.get(i);
-            if (s.quality == null || s.quality.isEmpty()) {
+            if (c.sources.get(i).displayKey().isEmpty()) {
                 return i;
             }
         }
@@ -1511,7 +1878,14 @@ public class MainActivity extends Activity {
         infoQualityRow.addView(pill, lp);
     }
 
-    /** 记下这路流实际输出的分辨率，下次显示真实清晰度。 */
+    /**
+     * 记下这路流实际输出的分辨率，下次显示真实清晰度。
+     *
+     * <p>只写 {@link Channel.Source#measured}，<b>绝不改写</b>节目单声明的
+     * {@link Channel.Source#quality}：档位是 {@link QualityCap} 判定的唯一依据，
+     * 被实测值一覆盖就说明"1080 的标签被记成 576"，上限随之失效，
+     * 降档后又会把 1080 当成低档挑回来。
+     */
     private void rememberRealQuality(int height) {
         String label = QualityMemory.labelOf(height);
         if (label == null || current < 0 || current >= channels.size()) {
@@ -1522,11 +1896,16 @@ public class MainActivity extends Activity {
             return;
         }
         Channel.Source s = c.source(sourceIndex);
-        if (label.equals(s.quality)) {
+        if (label.equals(s.measured)) {
             return;
         }
-        s.quality = label;
+        s.measured = label;
         QualityMemory.put(this, s.url, label);
+        // 标签和实测不一致时留个记录：节目单可能不准，也可能这路线路被降过码
+        if (!label.equals(s.quality) && !s.untagged()) {
+            android.util.Log.i("IPTVQUAL", "measured ch=" + c.name
+                    + " tag=" + s.quality + " real=" + label + " url=" + s.url);
+        }
         renderInfoBar(c);
     }
 
@@ -1548,6 +1927,23 @@ public class MainActivity extends Activity {
         retryRound = 0;
         hasPlayed = false;
         rebufferStart = 0;
+        // 用户亲手选了线路，就照他的选择播：清掉自动降档留下的上限，
+        // 否则切到高清后会被 cap 立刻打回低清，看起来像"点了没反应"
+        QualityCap.clear(this, c.name);
+        // 但降档许可不要锁死：用户选 1080 后发现确实卡，观察期过后仍会降下来，
+        // 否则就是"点了高清后一直卡着不动"。
+        qualityLoweredThisSession = false;
+        // 上一次自动降档的冷却也要清掉，否则用户是在自动降档后 30 秒内手动
+        // 选了高清，那条冷却会先把观察期过后的第一次降档挡回去。
+        lastQualityLowerAt = 0L;
+        // 观察期从这一刻起算：这段时间内禁止自动降档，避免用户刚点高清
+        // 就被一次起播缓冲打回低清。
+        lastManualPickAt = System.currentTimeMillis();
+        manualPickChannel = c.name;
+        manualGraceStrikes = 0;
+        android.util.Log.i("IPTVQUAL", "manual-pick ch=" + c.name
+                + " -> " + c.source(index).label()
+                + " grace=" + (MANUAL_PICK_GRACE_MS / 1000) + "s");
         loading.setVisibility(View.VISIBLE);
         speed.reset();
         LiveSpeedMeter.INSTANCE.reset();
@@ -1597,6 +1993,81 @@ public class MainActivity extends Activity {
             repickSource();
         }
     };
+
+    /**
+     * 当前线路喂不动时，<b>把清晰度降一档再重挑</b>，而不是只换同档的另一条。
+     *
+     * <p>实测（build/verify11.log 13:01:10~13:01:50）1080 线路的形态是：
+     * 每 5 秒的分片边界掉一次帧，{@code proc} 从 100 掉到 48~70，
+     * {@code held-stuck earlyUs≈280000}（正常是 45000）——
+     * 分片下载追不上播放，播放器只能攥着帧等数据。
+     * 这类问题换同档的另一条线路往往一样卡（同机房同码率），
+     * 真正有效的是降低码率需求本身。
+     *
+     * <p>降档只在<b>确认当前档位喂不动</b>时发生，且：
+     * <ul>
+     *   <li>同一次播放只降一次（{@link #qualityLoweredThisSession}）；</li>
+     *   <li>降后有 30 秒冷却（{@link #QUALITY_LOWER_COOLDOWN_MS}），
+     *       避免新线路起播的缓冲被当成又一次卡顿而连降两档；</li>
+     *   <li>上限由 {@link QualityCap} 落盘，后台精修也读同一份，
+     *       所以<b>不会自己弹回高清</b>。</li>
+     * </ul>
+     *
+     * @return true 表示已经降档并触发了重挑，调用方不要再走普通换线
+     */
+    private boolean lowerQualityInstead(Channel c, String why) {
+        if (qualityLoweredThisSession) {
+            return false;
+        }
+        long now = System.currentTimeMillis();
+        // 用户刚手动选过清晰度：给足观察期，这段时间不自动降档。
+        // 用户点了 1080 就是想看高清，两秒后就给他降回去等于无视他的选择。
+        //
+        // 但观察期保护的是<b>已经看到的画面</b>。若他选中那条线路压根没出过画面
+        // （{@code hasPlayed=false}，屏幕只有缓冲圈），就没有"打断观看"这回事：
+        // 继续禁止降档只会让看门狗连续超时，最后提示"该频道暂时无法播放"，
+        // 比降一档难看得多。此时放行降档，先想办法出个画面。
+        if (inManualGrace(c.name)) {
+            if (hasPlayed) {
+                android.util.Log.i("IPTVQUAL", "lower skip ch=" + c.name + " why=" + why
+                        + " manualGrace=" + ((now - lastManualPickAt) / 1000) + "s/"
+                        + (MANUAL_PICK_GRACE_MS / 1000) + "s");
+                return false;
+            }
+            android.util.Log.w("IPTVQUAL", "lower grace-waived ch=" + c.name + " why=" + why
+                    + " no-picture-yet");
+        }
+        if (now - lastQualityLowerAt < QUALITY_LOWER_COOLDOWN_MS) {
+            return false;
+        }
+        String cur = c.source(sourceIndex).label();
+        int curRank = c.source(sourceIndex).effectiveRank();
+        int cap = QualityCap.lowerBelow(this, c, curRank);
+        if (cap == Integer.MAX_VALUE) {
+            // 已经是能识别的最低档，没有再降的余地，交给普通换线
+            return false;
+        }
+        // 降档后必须在「新上限内」真的找到一条线路，否则不能宣布降档成功：
+        // 若直接退回 index 0，很可能又落回那条 1080，等于没降还白换一次线。
+        int next = quickestSource(c);
+        if (next < 0) {
+            // 上限内一条可用的都没有。撤掉刚写入的上限，让普通换线去处理，
+            // 免得把该频道锁在"无线路可选"的状态里。
+            android.util.Log.w("IPTVQUAL", "lower ch=" + c.name + " why=" + why
+                    + " but no source under cap=" + cap + ", revert");
+            QualityCap.clear(this, c.name);
+            return false;
+        }
+        qualityLoweredThisSession = true;
+        lastQualityLowerAt = now;
+        android.util.Log.w("IPTVQUAL", "lower ch=" + c.name + " why=" + why
+                + " from=" + (cur == null ? "自动" : cur) + " capRank=" + cap
+                + " to=" + c.source(next).label() + " idx=" + next);
+        // 降到新档位后重新挑：quickestSource 会按新上限取最高可播档
+        sourceIndex = next;
+        startPlayback(c);
+        return true;
+    }
 
     /** 当前线路彻底失败后重新探测换线，跳过已经失败的那一路。 */
     private void repickSource() {
@@ -1834,23 +2305,50 @@ public class MainActivity extends Activity {
         final boolean touch = isTouchMode();
         // 遥控器把焦点落到当前频道；触摸屏不抢焦点，避免出现无用的高亮
         if (!touch) {
-            list.requestFocus();
-            ui.postDelayed(() -> {
-                View target = list.getLayoutManager() == null ? null
-                        : list.getLayoutManager().findViewByPosition(Math.max(0, current));
-                if (target != null) {
-                    target.requestFocus();
-                }
-                // 焦点系统会把行再滚一次以留出余量，这里覆盖回去，
-                // 让当前行稳稳对齐列表首行，上方不残留半截行
-                ui.postDelayed(() -> {
-                    if (current >= 0) {
-                        scrollCurrentIntoComfort(current);
-                    }
-                }, 80);
-            }, 50);
+            focusDrawerList(0);
         }
         showBar();
+    }
+
+    /**
+     * 把焦点落进抽屉的频道列表，带重试。
+     *
+     * <p>抽屉刚 {@code setVisibility(VISIBLE)} 时还没布局：{@code list} 宽高为 0，
+     * {@code requestFocus()} 会静默失败，而 {@code findViewByPosition()} 也返回 null
+     * （行还没创建）。只试一次的结果就是"抽屉打开了但方向键没反应"——
+     * 实测左键打开后焦点仍停在 {@code root} 上。
+     *
+     * <p>所以按帧重试几次，每次都重新取当前行；取不到就退回落焦列表本身，
+     * 再由焦点系统自己找到第一个可聚焦的行。
+     */
+    private void focusDrawerList(int attempt) {
+        if (drawer.getVisibility() != View.VISIBLE) {
+            return;
+        }
+        View target = null;
+        if (list.getLayoutManager() != null && current >= 0) {
+            target = list.getLayoutManager().findViewByPosition(current);
+        }
+        boolean ok = target != null && target.requestFocus();
+        if (ok) {
+            // 焦点系统会把行再滚一次以留出余量，这里覆盖回去，
+            // 让当前行稳稳对齐列表首行，上方不残留半截行
+            ui.postDelayed(() -> {
+                if (current >= 0 && drawer.getVisibility() == View.VISIBLE) {
+                    scrollCurrentIntoComfort(current);
+                }
+            }, 80);
+            return;
+        }
+        if (attempt >= 6) {
+            // 真的取不到具体行：落焦列表本身，方向键至少能用
+            boolean listOk = list.requestFocus();
+            android.util.Log.w("IPTVFOCUS", "drawer-focus fallback current=" + current
+                    + " ok=" + listOk);
+            return;
+        }
+        // 布局还没完成，下一帧再试
+        ui.postDelayed(() -> focusDrawerList(attempt + 1), 40);
     }
 
     /** 有触摸能力且最近没有按键输入时按触摸屏处理。 */
@@ -1946,7 +2444,12 @@ public class MainActivity extends Activity {
                     return super.onKeyDown(keyCode, event);
                 }
                 if (!drawerOpen) {
-                    openDrawer();
+                    // OK 键呼出底部栏（原来的行为是打开左侧抽屉，
+                    // 现在左右键负责抽屉，OK 专管底栏）。
+                    // 必须同时把焦点落进胶囊：上下键已改为换台，
+                    // 若焦点留在画面上就再也选不到清晰度了。
+                    showInfoBar();
+                    focusQualityPill();
                     return true;
                 }
                 return super.onKeyDown(keyCode, event);
@@ -1963,16 +2466,12 @@ public class MainActivity extends Activity {
                 return super.onKeyDown(keyCode, event);
 
             case KeyEvent.KEYCODE_DPAD_DOWN:
+                if (inInfoBar()) {
+                    hideQualitySheet();
+                    return true;
+                }
                 if (!drawerOpen) {
-                    // 焦点下移到分辨率胶囊；已在胶囊上则由焦点系统继续横移
-                    if (inInfoBar()) {
-                        return super.onKeyDown(keyCode, event);
-                    }
-                    if (infoBar.getVisibility() == View.VISIBLE
-                            && infoQualityRow.getChildCount() > 0) {
-                        int idx = Math.min(sourceIndex, infoQualityRow.getChildCount() - 1);
-                        infoQualityRow.getChildAt(idx).requestFocus();
-                    }
+                    stepChannel(current + 1);
                     return true;
                 }
                 return super.onKeyDown(keyCode, event);
@@ -2002,24 +2501,26 @@ public class MainActivity extends Activity {
                     // 焦点在分辨率胶囊上，交给焦点系统横向移动
                     return super.onKeyDown(keyCode, event);
                 }
-                stepChannel(current - 1);
+                // 左键呼出左侧菜单（抽屉）
+                openDrawer();
                 return true;
 
             case KeyEvent.KEYCODE_DPAD_RIGHT:
                 if (drawerOpen || inInfoBar()) {
                     return super.onKeyDown(keyCode, event);
                 }
-                stepChannel(current + 1);
+                // 右键同样呼出左侧菜单：左右对称，用户不必记哪边是"开"
+                openDrawer();
                 return true;
 
             case KeyEvent.KEYCODE_BACK:
-                // 返回键逐层退出：先收底栏，再关抽屉，最后才交回系统
-                if (infoBar.getVisibility() == View.VISIBLE) {
-                    hideInfoBarNow();
-                    return true;
-                }
+                // 返回键逐层退出：焦点从胶囊收回画面 → 收底栏 → 关抽屉
                 if (inInfoBar()) {
                     hideQualitySheet();
+                    return true;
+                }
+                if (infoBar.getVisibility() == View.VISIBLE) {
+                    hideInfoBarNow();
                     return true;
                 }
                 if (drawerOpen) {
@@ -2041,6 +2542,40 @@ public class MainActivity extends Activity {
             default:
                 return super.onKeyDown(keyCode, event);
         }
+    }
+
+    /**
+     * 把焦点移到底部栏的清晰度胶囊上。
+     *
+     * <p>OK 键呼出底栏时必须一并落焦：上下键已改为换台，
+     * 焦点若留在画面上，用户就没有任何路径能选中清晰度。
+     *
+     * <p>落焦到<b>当前正在播的那一档</b>，而不是按线路下标猜：
+     * 胶囊是按清晰度去重后的视图，下标和 {@code sourceIndex} 并不同构。
+     */
+    private void focusQualityPill() {
+        if (infoQualityRow.getChildCount() == 0) {
+            return;
+        }
+        // 优先挑已选中（当前播放档）的那颗，没有就退回第一颗
+        View target = null;
+        for (int i = 0; i < infoQualityRow.getChildCount(); i++) {
+            View v = infoQualityRow.getChildAt(i);
+            if (v.isSelected()) {
+                target = v;
+                break;
+            }
+        }
+        if (target == null) {
+            target = infoQualityRow.getChildAt(0);
+        }
+        final View focus = target;
+        // 刚 setVisibility(VISIBLE) 的视图要等一次布局才接受焦点
+        focus.post(() -> {
+            if (infoBar.getVisibility() == View.VISIBLE) {
+                focus.requestFocus();
+            }
+        });
     }
 
     /** 遥控器焦点是否落在底部信息条的分辨率胶囊上。 */

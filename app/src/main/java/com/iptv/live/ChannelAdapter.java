@@ -144,8 +144,9 @@ public class ChannelAdapter extends RecyclerView.Adapter<ChannelAdapter.VH> {
             metaRow.removeAllViews();
             Set<String> seen = new java.util.LinkedHashSet<>();
             for (Channel.Source s : c.sources) {
-                if (s.quality != null && !s.quality.isEmpty()) {
-                    seen.add(s.quality);
+                String key = s.displayKey();
+                if (!key.isEmpty()) {
+                    seen.add(key);
                 }
             }
             for (String label : seen) {

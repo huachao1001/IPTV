@@ -196,6 +196,22 @@ public final class SourceProber {
         }
         double base = score(current);
         double gainNeeded = struggling ? REFINE_URGENT_GAIN : REFINE_GAIN;
+        // 清晰度上限：已经被判定喂不动而降到低档后，精修不许再把它抬回去。
+        // 没有这一条，1080 只要偶尔测出高突发速率就会被选中，
+        // 于是刚降下来又跳回 1080、再卡、再降 —— 画面反复重建。
+        final int cap = QualityCap.capRank(ctx, ch.name);
+        // 档位下限：精修<b>永远不许把画面换糊</b>。
+        //
+        // 用户的要求是"优先 1080"。而精修只是一次几秒的速率探测，
+        // 拿它去决定降档太武断：实测它曾在首帧出现前 2 秒就把 1080 判死，
+        // 一路降到 576，用户连高清长什么样都没看到。真正可靠的"喂不动"
+        // 证据只有播起来之后的形态——起播超时、反复重缓冲、分片跳号、
+        // 静默卡死，这些都由 {@code lowerQualityInstead()} 处理。
+        //
+        // 所以这里只允许"同档或更高"的替换：1080 卡可以换成另一条 1080，
+        // 但不会因为某个 576 线路恰好突发速率高就被顶掉。
+        int playingRank = ch.sources.get(playing).effectiveRank();
+        final int floor = Math.max(0, playingRank);
 
         CompletionService<Result> results = new ExecutorCompletionService<>(POOL);
         List<Future<Result>> probing = new ArrayList<>();
@@ -203,6 +219,10 @@ public final class SourceProber {
         int candidates = 0;
         for (int i = 0; i < ch.sources.size(); i++) {
             if (i == playing || Boolean.TRUE.equals(ch.sources.get(i).starved)) {
+                continue;
+            }
+            int r = ch.sources.get(i).effectiveRank();
+            if (r > cap || r < floor) {
                 continue;
             }
             final int idx = i;
@@ -276,11 +296,16 @@ public final class SourceProber {
         if (n == 1) {
             return exclude == 0 ? -1 : 0;
         }
+        // 清晰度上限：超过它的线路直接不参与竞争。
+        // 这是"降档后不再自己跳回高清"的关键——后台精修和失败重挑
+        // 都走这里，不可能越权升档。
+        final int cap = QualityCap.capRank(ctx, ch.name);
 
         // 候选少的时候没有备胎，每路都探久一点，读数更接近真实持续速率
         int alive = 0;
         for (int i = 0; i < n; i++) {
-            if (i != exclude && !Boolean.TRUE.equals(ch.sources.get(i).starved)) {
+            if (i != exclude && !Boolean.TRUE.equals(ch.sources.get(i).starved)
+                    && ch.sources.get(i).effectiveRank() <= cap) {
                 alive++;
             }
         }
@@ -298,19 +323,26 @@ public final class SourceProber {
             if (Boolean.TRUE.equals(ch.sources.get(i).starved)) {
                 continue;
             }
+            // 超过清晰度上限的线路不探：探了也不会选，白花时间
+            if (ch.sources.get(i).effectiveRank() > cap) {
+                continue;
+            }
             final int idx = i;
             candidates++;
             probing.add(results.submit(() -> probe(ch.sources.get(idx).url, budget)));
             probeIndex.add(i);
         }
         if (candidates == 0) {
-            // 全部被标记过喂不饱。网络状况会变，必须给一次重试机会，
-            // 但把 3 秒内刚失败的那一路留到最后，避免原地反复撞同一个坑
+            // 全部候选都被标记过喂不饱。网络状况会变，必须给一次重试机会，
+            // 但把 3 秒内刚失败的那一路排除在外，避免原地反复撞同一个坑。
+            //
+            // 注意只在「没被清晰度上限挡住」的线路里重试：
+            // 上限是用户看到卡顿后降档的结果，不能因为重试又把它抬回去。
             for (Channel.Source s : ch.sources) {
                 s.starved = null;
             }
             for (int i = 0; i < n; i++) {
-                if (i == exclude) {
+                if (i == exclude || ch.sources.get(i).effectiveRank() > cap) {
                     continue;
                 }
                 final int idx = i;

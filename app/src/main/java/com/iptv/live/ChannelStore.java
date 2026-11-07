@@ -19,21 +19,27 @@ import java.util.List;
 public final class ChannelStore {
 
     /**
-     * 默认数据源：mzky/checklist 的实时节目单。
+     * 默认数据源：best-fan/iptv-sources 的清单。
      *
-     * <p>条目自带 {@code response-time}（源站实测响应耗时）和 {@code tvg-logo}，
-     * 同一频道通常挂 9~18 条线路，选源时有充足的备胎；
-     * 比原先的 best-fan 清单线路更多、更新更勤。
+     * <p><b>换成它的理由是"清晰度"。</b>上一版用的 mzky/checklist 虽然线路多
+     * （519 条），但<b>一个清晰度标记都没有</b>，于是 {@link Channel#rank(String)}
+     * 全部返回 0，{@link Channel#sortBySpeed()} 退化成一味按 response-time 排，
+     * 永远命中最快的那批 720×576 小机房——画面一直是低清，这才是根因。
+     *
+     * <p>best-fan 的条目 292/314 带 {@code [1080]/[720]/[576]} 标记，
+     * 解析后 {@code Channel.Source.quality} 直接可用，选源就能按档位走。
+     * 实测标记可信：{@code 222.223.41.27} 的 [1080] 线路解析出 1920×1080。
      */
     public static final String DEFAULT_SOURCE =
-            "https://cdn.jsdelivr.net/gh/mzky/checklist@master/itvlist.m3u";
+            "https://cdn.jsdelivr.net/gh/best-fan/iptv-sources@master/cn_all_status.m3u8";
 
     /** 按顺序尝试的远程源，前一个失败自动换下一个。 */
     private static final String[] DEFAULT_SOURCES = {
+            "https://cdn.jsdelivr.net/gh/best-fan/iptv-sources@master/cn_all_status.m3u8",
+            "https://raw.githubusercontent.com/best-fan/iptv-sources/master/cn_all_status.m3u8",
+            "https://gh-proxy.com/https://raw.githubusercontent.com/best-fan/iptv-sources/master/cn_all_status.m3u8",
+            // 兜底：清晰度标记缺失，但线路更多、更新更勤
             "https://cdn.jsdelivr.net/gh/mzky/checklist@master/itvlist.m3u",
-            "https://raw.githubusercontent.com/mzky/checklist/master/itvlist.m3u",
-            "https://gh-proxy.com/https://raw.githubusercontent.com/mzky/checklist/master/itvlist.m3u",
-            "https://cdn.jsdelivr.net/gh/best-fan/iptv-sources@main/cn_all_status.m3u8",
     };
 
     private static final String CACHE = "channels.m3u8";
@@ -118,10 +124,12 @@ public final class ChannelStore {
     private void applyRemembered(List<Channel> list) {
         for (Channel c : list) {
             for (Channel.Source s : c.sources) {
-                if (s.quality == null || s.quality.isEmpty()) {
+                // 只补"实测值"，不动节目单声明的档位：
+                // 档位参与清晰度上限判定，写坏了下限就失效
+                if (s.measured == null || s.measured.isEmpty()) {
                     String known = QualityMemory.get(ctx, s.url);
                     if (known != null) {
-                        s.quality = known;
+                        s.measured = known;
                     }
                 }
             }

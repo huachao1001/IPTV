@@ -147,6 +147,148 @@ PROBE_TOTAL_MS = 4500   // 所有线路的总预算，到点才返回
   焦点在频道行上移动时实时预览，离开列表/切台/关抽屉即收起
 - 正在播放的台不弹预览（用户已经在看了）
 
+### 优先高清 + 卡顿降档 + 不来回切（本轮核心）
+
+策略是「**先试最高清，确认喂不动再降一档，降下去就锁住**」。
+
+#### 为什么需要「锁住」
+
+实测 1080 线路 `222.223.41.27:8888/hls/1/index.m3u8`：
+
+| 项目 | 实测值 |
+|------|--------|
+| 分辨率 | 1920×1080（`[1080]` 标签**可信**） |
+| 分片 | 6.2~6.5 MB / 6.3 秒 |
+| 码率需求 | **≈ 1.0 MB/s** |
+| 电视实际持续速率 | **0.42 ~ 0.54 MB/s**（首片突发可达 2.02 MB/s） |
+
+起播能出画面，播十几秒就缓冲耗尽。而 `SourceProber.pickBetter()` 每隔几秒
+在后台探一遍，**探的是分片开头的突发速率**，1080 偶尔被测出 2 MB/s
+就会被判"最优"选中 → 刚降下去又跳回 1080 → 再卡 → 再降。
+用户看到的就是画面反复重建。所以上限必须落盘、且所有选源路径共用。
+
+#### 三条不变量
+
+1. **档位只认节目单标记**：`Channel.Source.quality` 只由 `tvg-name` 的
+   `[1080]`/`[720]`/`[576]` 或频道名 `(720p)` 决定，**永不被实测覆盖**。
+   实测值写入独立的 `measured` 字段，只用于界面显示与同档内排序。
+   > 之前实测会把 `quality` 改成 576，档位因此漂移，`QualityCap` 判据失效。
+   > URL 里猜出来的 `hd`/`1080` 也只写 `measured`，不参与档位。
+2. **一次只降一档**：`QualityCap.nextLower()` 取「严格小于当前的最高档」。
+   1080 喂不动应降到 720，而不是直接跌到 576。
+3. **降档只信真实播放证据**，不信一次速度探测：
+   | 触发点 | 日志 `why=` | 形态 |
+   |--------|-------------|------|
+   | 起播看门狗超时 | `startup-timeout` | 7 秒没出画面 |
+   | 出画面后反复缓冲 | `rebuffer-heavy` | 90 秒内 ≥3 次进 `state=2` |
+   | 分片跳号 | `chunk-jump` | 连续 2 次断层 |
+   | 静默卡死 | `silent-stall` | 第 2 轮重开后仍不动 |
+
+#### 防来回切的四道闸
+
+| 闸 | 位置 | 作用 |
+|----|------|------|
+| `QualityCap`（落盘） | `quality_cap.xml` | 频道级清晰度上限，`CAP_TTL_MS = 3 小时` |
+| 选源过滤 | `SourceProber.pickBlocking` / `pickBetterBlocking` | 超上限的线路**不探测**，不可能被选中 |
+| 起播过滤 | `quickestSource()` | 上限内取最高档，同档取 `response-time` 最快 |
+| 记忆线路过滤 | `play()` 快路径一 | `SourceMemory` 的 URL 也要过上限，否则切台回来又撞 1080 |
+
+另外两条：
+- `qualityLoweredThisSession`：同一次播放**只降一次**，避免连续黑屏；
+- `QUALITY_LOWER_COOLDOWN_MS = 30 秒`：新线路起播的缓冲不算卡顿，
+  否则会一降到底（越看越糊）。
+
+精修（`pickBetterBlocking`）额外加 `floor`：**只许同档或更高**。
+一次几秒的探测不足以判定"喂不动"，降档一律交给上面四条真实证据。
+
+#### 用户手动选清晰度
+
+`switchQuality()` 会 `QualityCap.clear()`、重置 `qualityLoweredThisSession`
+**和** `lastQualityLowerAt`：用户亲手选了 1080 就照播 1080，但**仍允许**后续
+卡顿自动降档（否则就是"点了高清后一直卡着不动"）。
+
+清 `lastQualityLowerAt` 是必须的：上一轮自动降档留下的 30 秒冷却如果不清，
+用户刚点完高清，观察期一过就撞上这条冷却，第一次降档会被无声吞掉。
+
+##### 90 秒观察期（`MANUAL_PICK_GRACE_MS`）
+
+用户手动点了某档清晰度之后，`MANUAL_PICK_GRACE_MS = 90 秒` 内**禁止自动降档**
+（`lowerQualityInstead()` 直接返回 false，日志 `IPTVQUAL lower skip ... manualGrace=Ns/90s`），
+精修也**不做任何静默换线**（日志 `IPTVPLAY refine skip-manual-grace`）。
+理由：用户点 1080 说明他想看高清；若两秒后因一次起播缓冲就被降回 720，
+他只会觉得"点了没反应"或"跟我对着干"。换线会重建管线、画面黑一下，
+刚从菜单里选完就看到黑屏同样是坏体验。
+
+**观察期绑定频道名**（`manualPickChannel` + `inManualGrace(channel)`）。
+不能做成全局 90 秒：用户在 A 台点了高清，马上换到 B 台，
+B 台的自动降档和精修不该被 A 台的操作一起冻住——B 台可能本来就喂不动。
+
+**唯一的豁免：还没出过画面。** `lowerQualityInstead()` 里若 `hasPlayed == false`
+（屏幕只有缓冲圈，没有"被打断的观看"），允许降档，日志
+`IPTVQUAL lower grace-waived ... no-picture-yet`。否则用户选中一条死线路时
+只能连续 4 轮起播超时（约 40 秒黑屏），最后提示"该频道暂时无法播放"，
+比降一档难看得多。
+
+**起播看门狗的手动豁免**：观察期内第一次 `startup-timeout` 先重开**同一条**线路
+（`manualGraceStrikes` / `MANUAL_GRACE_STRIKES = 1`，日志
+`IPTVSTALL startup-timeout retry-same ... strike=1/1`），第二次才降档。
+高码率源起播慢七八秒很常见，一次超时就降档等于"点了 1080 七秒后变 720"。
+
+> `manualGraceStrikes` 在 `play()`、`switchQuality()`、`disarmStartupWatchdog()`
+> 三处都要清零。它属于单次播放，不能带到下一次——否则某次重试过之后，
+> 后续每次起播超时都会少一次机会。
+
+### 清晰度上限的两个陷阱（已修，勿回退）
+
+**1. `effectiveRank()` 只能认节目单标记，绝不掺实测值。**
+`Source.quality` 是档位的唯一依据，实测结果只写 `Source.measured`（仅供显示与同档排序）。
+早期版本让 `effectiveRank()` 在无标记时回退到 `measured`，后果是：
+一条无标记线路播过一次被测成 576P，档位就从 0 变成 576，
+立刻被"降到底档"的上限 `cap=0` 排除掉——**明明被允许的线路自己消失了**。
+
+**2. `nextLower()` 不许退到 0。**
+曾经在没有更低标记档时返回 0（含义"只允许无标记线路"），
+实测是个陷阱（`build/final_grace.log` 14:58:56）：那批线路清晰度未知，
+既可能是真 576，也可能是没标清楚的 1080 坏源。降下去后连续三路
+`startup-timeout`、`buffered=0`，而这个上限会落盘保留 3 小时，
+**该频道 3 小时内彻底放不出来**。现在没有更低标记档时返回 `Integer.MAX_VALUE`
+（"降不下去"），让调用方去换同档线路。
+
+**兜底：放弃判定前先撤销上限。**
+起播看门狗在 `startupFailures >= STARTUP_GIVE_UP_ROUNDS` 时，若该频道
+还有清晰度上限，先 `QualityCap.clear()` + 清掉所有 `starved` 标记再 `repickSource()`，
+日志 `IPTVQUAL give-up releases cap ...`，而不是直接提示"无法播放"。
+这样即使上限被历史数据污染（`quality_cap.xml` 会跨启动保留 3 小时），
+也能自愈回可播状态。这层兜底和 `nextLower()` 无关：
+即使以后降档逻辑再出错，它也能把这个台救回来。
+
+### 数据源更换：mzky → best-fan
+
+旧 seed（`mzky/checklist`）519 条线路**一个清晰度标记都没有**，
+`Channel.rank()` 全返回 0，`sortBySpeed()` 退化成纯按 `response-time` 排，
+于是永远命中最快的那批 720×576 小机房——**这才是"画面一直是低清"的根因**。
+
+`best-fan/iptv-sources` 的条目带 `[1080]/[720]/[576]` 标记，实测可信。
+合并后：**754 线路 / 153 频道 / 303 条带标记**（1080P=173、720P=29、576P=99）。
+
+> 合并脚本 `build/merge_seed.py`：best-fan 优先，旧 seed 补全不重复的线路。
+> 注意 `[S]` 后缀（如 `CCTV1[1080][S]`）不会拆台：`qualityOf()` 取第一个括号。
+
+### 遥控器按键（本轮按要求重排）
+
+| 键 | 行为 |
+|----|------|
+| **上 / 下** | 上/下一个频道 |
+| **左 / 右** | 打开左侧抽屉（分组 + 频道列表） |
+| **OK / 确认** | 打开底部信息条，并把焦点落到当前清晰度胶囊 |
+| **BACK** | 逐层退出：胶囊 → 底栏 → 抽屉 |
+
+- 抽屉打开后焦点落到**当前频道行**，`focusDrawerList()` 带 6 次重试：
+  抽屉刚 `setVisibility(VISIBLE)` 时 `RecyclerView` 还没布局，
+  一次性 `requestFocus()` 会静默失败（实测焦点停在 `root` 上）。
+- OK 键必须同时 `focusQualityPill()`：上下键已改为换台，
+  焦点留在画面上就再也选不到清晰度了。
+
 ---
 
 ## 三、待办
