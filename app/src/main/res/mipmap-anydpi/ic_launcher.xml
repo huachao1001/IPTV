@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 桌面图标：天线电视（满版方形） -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:fillColor="#0B1018" android:pathData="M0,0h108v108h-108z" />
+    <group
+        android:scaleX="1"
+        android:scaleY="1"
+        android:translateX="0.00"
+        android:translateY="-7.80">
+        <path
+            android:fillColor="#3D8BFD"
+            android:pathData="M16.5,36H91.5A14.5,14.5 0 0 1 106,50.5V85.5A14.5,14.5 0 0 1 91.5,100H16.5A14.5,14.5 0 0 1 2,85.5V50.5A14.5,14.5 0 0 1 16.5,36Z" />
+        <path
+            android:fillColor="#0B1018"
+            android:pathData="M13.1,41.5H94.9A5.6,5.6 0 0 1 100.5,47.1V88.9A5.6,5.6 0 0 1 94.9,94.5H13.1A5.6,5.6 0 0 1 7.5,88.9V47.1A5.6,5.6 0 0 1 13.1,41.5Z" />
+        <path
+            android:fillColor="#3D8BFD"
+            android:pathData="M52.5,101.5H55.5A2.5,2.5 0 0 1 58,104V104A2.5,2.5 0 0 1 55.5,106.5H52.5A2.5,2.5 0 0 1 50,104V104A2.5,2.5 0 0 1 52.5,101.5Z" />
+        <path
+            android:fillColor="#3D8BFD"
+            android:pathData="M41.5,106.5H66.5A2.5,2.5 0 0 1 69,109V109A2.5,2.5 0 0 1 66.5,111.5H41.5A2.5,2.5 0 0 1 39,109V109A2.5,2.5 0 0 1 41.5,106.5Z" />
+        <path
+            android:fillColor="#3D8BFD"
+            android:pathData="M31.6,17A3.4,3.4 0 1 0 38.4,17A3.4,3.4 0 1 0 31.6,17Z" />
+        <path
+            android:fillColor="#3D8BFD"
+            android:pathData="M69.6,17A3.4,3.4 0 1 0 76.4,17A3.4,3.4 0 1 0 69.6,17Z" />
+        <path
+            android:pathData="M52.2,38L35,17"
+            android:strokeColor="#3D8BFD"
+            android:strokeWidth="5.2"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round" />
+        <path
+            android:pathData="M55.8,38L73,17"
+            android:strokeColor="#3D8BFD"
+            android:strokeWidth="5.2"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round" />
+        <path
+            android:pathData="M14,68Q27.33,56.80 40.67,68Q54.00,79.20 67.33,68Q80.67,56.80 94.00,68"
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="6.6"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round" />
+    </group>
+</vector>

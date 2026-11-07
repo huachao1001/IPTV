@@ -38,3 +38,5 @@ Thumbs.db
 
 # DSH / tooling
 .tools/
+__pycache__/
+*.pyc
