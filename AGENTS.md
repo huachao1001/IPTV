@@ -1145,3 +1145,130 @@ $py="$env:USERPROFILE\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\
 8. **`am start` 不会重跑 `play()`**：应用已在跑时它只把任务提到前台，
    于是没有新的 `IPTVCH`。脚本要读在播台必须先 `am force-stop` 再 `am start`。
 9. **图标改矢量图在 Android 6 上无效**：见上文「图标：Android 6 用不到矢量图」。
+10. **`Map.merge` / `Integer::sum` 让电视一开就闪退**：见下文
+    「Java 8 的集合/函数式 API 在 Android 6 上会闪退」。这是**装完点开
+    立刻回桌面**级的事故，模拟器（API 34）永远测不出来。
+
+---
+
+## 六、Java 8 的集合/函数式 API 在 Android 6 上会闪退（必读）
+
+### 事故现象
+
+新包 `install -r` 成功、桌面图标也换成新的了，**但点开 App 立刻闪回桌面**，
+连首帧都不出。真机 logcat：
+
+```
+I/art: Rejecting re-init on previously-failed class java.lang.Class<com.iptv.live.source.PlaylistParser$$ExternalSyntheticLambda0>
+E/AndroidRuntime: FATAL EXCEPTION: main
+    java.lang.NoClassDefFoundError: com.iptv.live.source.PlaylistParser$$ExternalSyntheticLambda0
+        at com.iptv.live.source.PlaylistParser.voteGroups(PlaylistParser.java:175)
+        at com.iptv.live.source.PlaylistParser.parse(PlaylistParser.java:121)
+        at com.iptv.live.source.ChannelStore.load(ChannelStore.java:121)
+        at com.iptv.live.MainActivity.loadChannels(MainActivity.java:1410)
+        at com.iptv.live.MainActivity.onCreate(MainActivity.java:1204)
+```
+
+肇事代码只有一行：
+
+```java
+v.merge(g, 1, Integer::sum);          // ← API 24+，电视是 API 23
+```
+
+### 为什么 `NoClassDefFoundError` 而不是 `NoSuchMethodError`
+
+`Integer::sum` 是方法引用，dex 编译器会把它编成一个**合成 lambda 类**
+（`PlaylistParser$$ExternalSyntheticLambda0`）。这个合成类在构造时会去调
+`java.util.function.BiFunction`——而 `java.util.function` 整个包是
+**API 24 才加的**，API 23 的 `bootclasspath` 里根本没有这个类。
+于是类初始化失败 → ART 记住"这个类坏了"（`Rejecting re-init on
+previously-failed class`）→ 每次走到这里都直接抛 `NoClassDefFoundError`。
+
+**注意报错信息会骗人**：它指向的是合成 lambda 类，不是 `Map.merge`。
+看到 `$$ExternalSyntheticLambda` + `NoClassDefFoundError`，
+第一反应就应该是「哪行写了 `::` 或 stream」。
+
+### 修复
+
+手动累加，语义完全等价：
+
+```java
+Integer prev = v.get(g);
+v.put(g, prev == null ? 1 : prev + 1);
+```
+
+### 禁用清单（本项目 `minSdk 21`，必须当作 API 21 底线）
+
+下表全部**不能用**。即使 `compileSdk 34` 能编过、desugar 也不保证，
+真机就是崩。当前代码已全部合规，**改动时别又写回去**：
+
+| 分类 | 禁止的写法 | 最早可用 API |
+|------|-----------|-------------|
+| `Map` | `.merge(k, v, fn)` / `.computeIfAbsent` / `.computeIfPresent` / `.compute` / `.putIfAbsent` / `.getOrDefault` / `.replaceAll` / `.forEach` | **24** |
+| `List`/`Set` | `.removeIf` / `.replaceAll` / `.sort(Comparator)` / `.forEach` | **24** |
+| `Collection` 工厂 | `List.of(...)` / `Map.of(...)` / `Set.of(...)` | **30** |
+| 工具 | `String.join(...)` | **26** |
+| 比较器工厂 | `Comparator.comparing` / `.thenComparing` / `.reversed` | **24** |
+| 函数式 | 方法引用 `this::x`、`Integer::sum`、`cls::new`；`java.util.function.*` 任何类型 | **24** |
+| Stream | `.stream()` / `.parallelStream()` / `Collectors.*` | **24** |
+| Optional | `java.util.Optional` 作为库 API 使用时注意 `orElseThrow()` 等重载 | 视方法 |
+
+### 允许的替代写法（已经在用，直接照抄）
+
+| 想要的 | 本项目写法 |
+|--------|-----------|
+| `list.addAll(List.of(a, b))` | `Arrays.asList(a, b)` |
+| `list.sort(cmp)` | `Collections.sort(list, cmp)` |
+| `list.removeIf(p)` | 手写 `for (int i = list.size() - 1; i >= 0; i--) { if (p) list.remove(i); }` |
+| `map.computeIfAbsent(k, x -> new V())` | `V v = map.get(k); if (v == null) { v = new V(); map.put(k, v); }` |
+| `map.getOrDefault(k, 0)` | `Integer v = map.get(k); ... v == null ? 0 : v` |
+| lambda 监听器 | **匿名内部类**，或已有的 `interface`（见下） |
+| `Integer::sum` | `prev + 1` 手算 |
+
+**lambda 位置本身就是合法的**（`(a, b) -> ...` 当参数传不会编出
+`java.util.function` 依赖，desugar 会展开成匿名类）。真正致命的是
+**把 lambda 传给一个「只在 API 24+ 存在」的方法**——那才会走
+`java.util.function`。所以：
+
+- ✅ `Collections.sort(list, (a, b) -> ...)` — 安全，已在用
+- ✅ `v.post(this::placeHint)` — 安全，`View.post` 是老 API
+- ❌ `v.merge(g, 1, Integer::sum)` — 崩，`merge` 要 `BiFunction`
+- ❌ `map.computeIfAbsent(k, k2 -> new ArrayList<>())` — 崩，同上
+
+判据一句话：**方法本体在 API 23 有没有？有没有哪个参数是
+`java.util.function.*`？** 两者任一不满足就换写法。
+
+### 怎么提前发现（Lint 查不出来）
+
+实测 `gradlew :app:lintDebug` 对这个**完全静默**（`NewApi` 命中 0 条）：
+Lint 只检查 framework API 的调用点，它看到 `Map.merge` 时按
+`compileSdk` 判定，不认为有问题；而合成 lambda 类更在它的视野之外。
+
+所以只能靠**两道人工闸**：
+
+1. **提交前 grep 禁用清单**（PowerShell，注意别用 `Set-Content`）：
+
+   ```powershell
+   Get-ChildItem -Recurse app\src\main\java -Filter *.java |
+     Select-String -Pattern "\.merge\(|\.computeIfAbsent\(|\.getOrDefault\(|\.putIfAbsent\(|\.removeIf\(|\.stream\(|List\.of\(|Map\.of\(|Set\.of\(|String\.join\(" |
+     ForEach-Object { "$($_.Filename):$($_.LineNumber): $($_.Line.Trim())" }
+   ```
+
+   命中 `replaceAll` 不用慌——`String.replaceAll` 是老 API，
+   只有 **`Collection.replaceAll`** 才是 API 24。看接收者类型区分。
+
+2. **每轮必须上真机点开一次**。模拟器是 API 34，`java.util.function`
+   齐全，**这个 bug 在模拟器上 100% 复现不出来**。
+   真机判据：`am start` 后 15 秒内 logcat 里要有 `IPTVCH play ch=`
+   和 `IPTVPLAY state=3`；只有 `FATAL EXCEPTION` 就是崩了。
+
+### 顺带记住：`ChannelStore.java:758` 那条注释是同一类坑的前车之鉴
+
+```java
+// List.sort(Comparator) 是 API 24 才加的，Android 6(API 23) 上会 NoSuchMethodError。
+Collections.sort(list, new Comparator<Channel>() { ... });
+```
+
+早就踩过一次，当时修了 `List.sort`，但 `PlaylistParser` 里的
+`Map.merge` 漏网了。**这两处是同一个病的两个病灶**：以后新增任何
+「Java 8 看起来很顺手」的写法，先回来对一遍上面的禁用清单。

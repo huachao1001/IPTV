@@ -172,7 +172,12 @@ public final class PlaylistParser {
             }
             String g = e.group == null ? "" : e.group.trim();
             if (!g.isEmpty()) {
-                v.merge(g, 1, Integer::sum);
+                // 不能用 Map.merge(g, 1, Integer::sum)：merge 和 java.util.function
+                // 都是 API 24 才有的，电视是 Android 6（API 23），
+                // 会抛 NoClassDefFoundError: PlaylistParser$$ExternalSyntheticLambda0，
+                // 表现为「装完点开立刻闪退回桌面」。手动累加等价且老版本安全。
+                Integer prev = v.get(g);
+                v.put(g, prev == null ? 1 : prev + 1);
             }
             if (!firstRaw.containsKey(e.key)) {
                 firstRaw.put(e.key, g);
