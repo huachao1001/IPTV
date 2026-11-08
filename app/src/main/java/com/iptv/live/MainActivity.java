@@ -58,6 +58,7 @@ import com.iptv.live.source.DailyRefresh;
 import com.iptv.live.source.DeadSources;
 import com.iptv.live.source.QualityCap;
 import com.iptv.live.source.QualityMemory;
+import com.iptv.live.source.SourceAudit;
 import com.iptv.live.source.SourceHealth;
 import com.iptv.live.source.SourceMemory;
 import com.iptv.live.source.SourceProber;
@@ -77,6 +78,15 @@ public class MainActivity extends Activity {
     private static final long STALL_LIMIT_MS = 6000;
     /** 卡死检测的轮询间隔。 */
     private static final long STALL_POLL_MS = 1000;
+    /**
+     * 体检结论汇总重绘的节流窗口。
+     *
+     * <p>体检线程每测完一条线路就回调一次，而重绘要重建右侧面板 +
+     * 让整个频道列表重新 bind。攒一小会儿再刷，见 {@link #refreshMenuHealth}。
+     */
+    private static final long HEALTH_REFRESH_MS = 900;
+    /** 已经排了一次延迟重绘，别重复排。 */
+    private boolean healthRefreshPending;
     /**
      * 同一条线路原地重试的轮数。
      * 节目单里的流很稳，报错多是分片偶发 404，重试几次就能接上，
@@ -340,9 +350,7 @@ public class MainActivity extends Activity {
         if (bufferUi != null) {
             bufferUi.onBuffering(!hasPlayed);
         }
-    }
-
-    private void stopBufferProgress() {
+    }    private void stopBufferProgress() {
         if (bufferUi != null) {
             bufferUi.onReady();
         }
@@ -427,6 +435,43 @@ public class MainActivity extends Activity {
     /** 本次播放已经因为静默卡死重启过几次。 */
     private int silentStallRounds = 0;
 
+    /**
+     * 带宽余量的开/关阈值，单位是「实测速率 ÷ 码率需求」的百分比。
+     *
+     * <p>开要 160%、关要 130%：中间这 30% 是滞回带。没有滞回的话，
+     * 播放速率一直在 1.5 倍上下晃，体检线程会被每秒开开关关几十次，
+     * 每次开关都要抢一次锁通知——比不测还费。
+     *
+     * <p>为什么是 1.6 倍：体检一次要开两条连接、每条读几十 KB。
+     * 若只富余 20~30%，两条探测就能把正在播的这一路挤到播空。
+     * 1.6 倍意味着留出六成带宽给探测，剩下的仍然够播。
+     */
+    private static final long AUDIT_ON_PCT = 160;
+    private static final long AUDIT_KEEP_PCT = 130;
+    /**
+     * 拿不到码率需求（裸流不报分片时长）时，退回看缓冲厚度。
+     *
+     * <p>这类流的上限是直播窗口，能攒到 8 秒就说明确实有余量。
+     */
+    private static final long AUDIT_MIN_BUFFER_MS = 8_000L;
+    /**
+     * 从"有余量"掉到"没余量"之后，还继续允许探测多久。
+     *
+     * <p>给分片边界留路：一条 5 秒片下完后，测速的 4 秒窗口里可能暂时
+     * 一条样本都没有（读数变空），再过两三秒新片才开始下。按"读数一变空就关"
+     * 处理，实测每 2~4 秒开合一次，探测线程被打断得一条都测不完。
+     */
+    private static final long AUDIT_OFF_GRACE_MS = 6_000L;
+    /** 上一拍的余量结论，用来做滞回。 */
+    private boolean auditHeadroom;
+    /**
+     * 上一次确认"有余量"的时刻，0 表示本次播放还没确认过。
+     *
+     * <p>两个用途：给关闭加宽限（见 {@code silentStallTick}），
+     * 以及保证起播那几秒一开始不会抢带宽。
+     */
+    private long auditOkAt;
+
     private final Runnable silentStallTick = new Runnable() {
         @Override
         public void run() {
@@ -458,6 +503,59 @@ public class MainActivity extends Activity {
                         g.onStablePlayback();
                     }
                 }
+                // 带宽有没有余量，交给线路体检决定要不要开始探测。
+                //
+                // 判据是「下载速率相对这路流的码率需求有多少富余」，**不是**
+                // 「缓冲攒了多厚」。这一点踩过：早先要求 buffered > 8 秒，
+                // 而很多源一个分片窗口只有 3~5 秒，缓冲永远到不了 8 秒
+                // （实测模拟器 logcat 里 buffered 峰值 5.3 秒），于是体检
+                // 一次都不会跑，菜单里"每个档位都有活线"这个承诺等于没做。
+                //
+                // 真正决定"能不能再开两条探测连接"的是带宽：实测达成速率
+                // 达到码率需求的 1.6 倍以上，才有富余去测别的线路。
+                // 带滞回（退到 1.3 倍以下才关），避免阈值附近每秒开关一次。
+                boolean headroom = false;
+                if (eligible) {
+                    long got = speed.bytesPerSecond();
+                    long need = speed.requiredBytesPerSecond();
+                    if (need > 0 && got > 0) {
+                        long pct = got * 100L / need;
+                        headroom = pct >= (auditHeadroom ? AUDIT_KEEP_PCT : AUDIT_ON_PCT);
+                    } else {
+                        // 拿不到码率需求（裸流不报 mediaDuration）：退回看缓冲厚度，
+                        // 只在这种能一直攒的流上成立
+                        headroom = p.getTotalBufferedDuration() >= AUDIT_MIN_BUFFER_MS;
+                    }
+                }
+                // 关闭要宽限，但**只在"刚刚确实有余量"之后**宽限：
+                //
+                // 1. 分片边界那一两秒，测速窗口里可能没有新样本（读数沿用上一份，
+                //    但 `eligible` 会短暂为 false）；
+                // 2. 同时刻播放器常掉进 STATE_BUFFERING，这恰恰是
+                //    "一整个分片刚播完、下一个还没到"的正常节奏，**不是**卡顿。
+                //    真卡顿会持续好几秒，6 秒窗口足够区分。
+                //
+                // 早先在这里把 `!eligible` 当成"硬证据立刻关"，实测结果是
+                // 每 5~6 秒开关一次（每个分片一遍），探测线程每次读两三秒
+                // 就被打断，一条都测不完——菜单里于是永远显示"未知"。
+                //
+                // 反过来，宽限必须有"上一次有余量"这个前提：否则起播那几秒
+                // （还没出画面、没有余量可言）也会被宽限放行，
+                // 等于一开始就抢带宽。
+                long nowMs = System.currentTimeMillis();
+                if (headroom) {
+                    auditOkAt = nowMs;
+                }
+                boolean effective = headroom
+                        || (auditOkAt > 0 && nowMs - auditOkAt < AUDIT_OFF_GRACE_MS);
+                if (effective != auditHeadroom) {
+                    android.util.Log.i("IPTVAUDIT", "headroom " + (effective ? "on" : "off")
+                            + " speed=" + LoadSpeedMeter.format(speed.bytesPerSecond())
+                            + " need=" + LoadSpeedMeter.format(speed.requiredBytesPerSecond())
+                            + " buffered=" + p.getTotalBufferedDuration());
+                    auditHeadroom = effective;
+                }
+                SourceAudit.setHeadroom(effective);
             }
             ui.postDelayed(this, SILENT_STALL_TICK_MS);
         }
@@ -976,11 +1074,20 @@ public class MainActivity extends Activity {
             player.addAnalyticsListener(new AnalyticsListener() {
                 @Override
                 public void onLoadCompleted(EventTime eventTime, LoadEventInfo info, MediaLoadData data) {
-                    speed.record(info.bytesLoaded, info.loadDurationMs);
+                    // 分片覆盖的媒体时长，用来算这路流的码率需求（判断带宽余量要用）。
+                    // MediaLoadData 给的是媒体时间范围，不是时长：两者相减。
+                    // 请求清单/密钥这类没有媒体时间范围，结果是 0，正好被
+                    // LoadSpeedMeter 当成"不知道"跳过，不会污染码率统计。
+                    long mediaMs = 0;
+                    if (data != null && data.mediaEndTimeMs > data.mediaStartTimeMs) {
+                        mediaMs = data.mediaEndTimeMs - data.mediaStartTimeMs;
+                    }
+                    speed.record(info.bytesLoaded, info.loadDurationMs, mediaMs);
                     noteChunk(info.uri == null ? null : info.uri.toString());
                     android.util.Log.i("IPTVLOAD", "bytes=" + info.bytesLoaded
                             + " ms=" + info.loadDurationMs
                             + " speed=" + LoadSpeedMeter.format(speed.bytesPerSecond())
+                            + " need=" + LoadSpeedMeter.format(speed.requiredBytesPerSecond())
                             + " uri=" + info.uri);
                 }
 
@@ -1045,6 +1152,9 @@ public class MainActivity extends Activity {
                             // 这是「滚雪球」刷新唯一的存活证据：旧线路默认保留，
                             // 只有既不在新清单里、又很久没播成功过才会被淘汰。
                             SourceHealth.markGood(MainActivity.this, c.url(sourceIndex));
+                            // 真播起来了：比任何探测都硬的证据，直接置为"可用"，
+                            // 免得体检线程把它再排一遍、或菜单里被误判成死档。
+                            SourceAudit.markPlaying(c.url(sourceIndex));
                         }
                     }
                 }
@@ -1092,12 +1202,59 @@ public class MainActivity extends Activity {
         }
 
         loadChannels(getIntent().getIntExtra("channel", -1));
+        // 线路体检的结论一更新就重绘菜单：用户在菜单里停留的十几秒内，
+        // 面板上的"某档有没有可用线路"会跟着实测结果变化，而不是点下去才发现是死的。
+        SourceAudit.setListener(() -> ui.post(() -> {
+            if (isMenuOpen()) {
+                refreshMenuHealth();
+            }
+        }));
         ui.post(tick);
         if (!PREVIEW_ONLY) {
             ui.post(silentStallTick);
             // 规则 6：每次打开都在后台刷新，顺带剔除已证伪的坏线路
             refreshInBackground();
         }
+    }
+
+    /**
+     * 菜单里显示"每个选项有没有可用线路"。
+     *
+     * <p>只在菜单打开时重绘：体检结论每测完一条就回调一次，
+     * 关着菜单时刷界面纯属浪费（一次会话要测几十条）。
+     *
+     * <p><b>必须防抖。</b>体检有 2 个线程，模拟器上一条线路的结论
+     * 1~2 秒就来一个，而这里做的两件事都很重：
+     * {@code renderQualityPanel()} 会把右侧面板的 View 全部
+     * {@code removeAllViews()} 重建，{@code notifyDataSetChanged()}
+     * 会让整个频道列表重新 bind。每次都做的话，用户正在按上下键浏览时
+     * 列表会被反复重排，滚动动画和焦点都可能被"按住不动"——
+     * 观感就是"滑动卡一下卡一下"。
+     *
+     * <p>结论是<b>供人看</b>的，没必要精确到毫秒。攒到 {@link #HEALTH_REFRESH_MS}
+     * 再刷一次，界面上的"某一档从可用变成 ✕"最多慢 0.9 秒，用户完全无感。
+     */
+    private void refreshMenuHealth() {
+        if (!isMenuOpen()) {
+            return;
+        }
+        if (healthRefreshPending) {
+            return;
+        }
+        healthRefreshPending = true;
+        ui.postDelayed(() -> {
+            healthRefreshPending = false;
+            if (!isMenuOpen()) {
+                return;
+            }
+            Channel c = playingChannel();
+            if (c != null) {
+                renderQualityPanel(c);
+            }
+            if (adapter != null) {
+                adapter.notifyDataSetChanged();
+            }
+        }, HEALTH_REFRESH_MS);
     }
 
     /**
@@ -1577,6 +1734,13 @@ public class MainActivity extends Activity {
         // 名字和图标立刻显示，不让用户对着黑屏等探测
         nowName.setText(c.name);
         nowMeta.setText(ChannelGroups.displayName(c.group));
+        // 「当前在播哪个台」的唯一可机读出口。
+        //
+        // 顶栏 6 秒后自动隐藏，而 uiautomator dump 在换台期间要等主线程空闲
+        // （阻塞探测那几秒正好卡在这里），等它返回顶栏已经没了——自动化脚本
+        // 读 nowName 会读到空串，把"换台成功"误判成"换台失败"（实测
+        // build/t_base2.py 场景 A/D 就是这么假失败的）。日志不受界面计时影响。
+        android.util.Log.i("IPTVCH", "play ch=" + c.name + " idx=" + index);
         renderTopLogo(c);
         // "正在播放"按名字刷新：列表里只有这个台会带上标记
         adapter.setPlaying(playingName);
@@ -1598,6 +1762,9 @@ public class MainActivity extends Activity {
         PlaybackCache.cancelPrefetch();
         // 换台后重新统计网速，避免显示上一条流的读数
         speed.reset();
+        // 余量结论也重新挣：新的一路码率需求不同，上一台的"有富余"不作数
+        auditHeadroom = false;
+        auditOkAt = 0;
         LiveSpeedMeter.INSTANCE.reset();
         if (PREVIEW_ONLY) {
             // 预览模式不探测网络，直接按当前线路渲染静态画面
@@ -1687,23 +1854,32 @@ public class MainActivity extends Activity {
         // 选「广东卫视」播 CCTV-11），而带台名代号的线路是清单自身的
         // 正向证据。若这里仍单纯按档位选最大，就会越过排序结果
         // 去选一条"档位最高但名字错"的线路，assignTrust 白做。
+        //
+        // <b>已经被线路体检证伪的地址直接跳过</b>：那是"连清单都取不到"
+        // 的 0/1 事实，不是速度猜测。跳过它等于用户按下去之前
+        // 就已经排掉了必然黑屏的那条。
         int bestTrust = -1;
         for (Channel.Source s : c.sources) {
-            if (Boolean.TRUE.equals(s.starved) || s.effectiveRank() > cap) {
+            if (Boolean.TRUE.equals(s.starved) || s.effectiveRank() > cap
+                    || SourceAudit.isBad(s.url)) {
                 continue;
             }
             if (s.trust > bestTrust) {
                 bestTrust = s.trust;
             }
         }
-        if (bestTrust < 0) {
+        // 全都体检不过时再放宽一次：宁可让用户撞一次也可能能播的线路，
+        // 也不要因为他恰好开着菜单、体检先跑完就直接判"无线路可选"。
+        // 体检的结论只有 90 秒有效期，一次临时断网不该锁死一个台。
+        if (bestTrust < 0 && !c.sources.isEmpty()) {
             return -1;
         }
         int best = -1;
         int bestRank = -1;
         for (int i = 0; i < c.sources.size(); i++) {
             Channel.Source s = c.sources.get(i);
-            if (Boolean.TRUE.equals(s.starved) || s.trust != bestTrust) {
+            if (Boolean.TRUE.equals(s.starved) || s.trust != bestTrust
+                    || SourceAudit.isBad(s.url)) {
                 continue;
             }
             int r = s.effectiveRank();
@@ -1876,21 +2052,47 @@ public class MainActivity extends Activity {
         qualityRow.removeAllViews();
         String currentLabel = c.source(sourceIndex).displayKey();
 
-        // 每档只保留一个代表线路：先出现的那条（sources 已按可信度/速度排好）。
-        // 用 LinkedHashMap 记住"档位 -> 代表线路下标"，顺便保住首次出现次序。
-        Map<String, Integer> best = new LinkedHashMap<>();
-        int firstUnknown = -1;
+        // 每档只保留一个代表线路，但<b>优先取已验证能出数据的那条</b>。
+        //
+        // 这是"点哪个都能播"的关键：同一档里有好几条线路，节目单排序把
+        // 名字最可信的放前面，而它可能刚好是个死链（机房今天下线了）。
+        // 若照抄第一条，用户点 1080P 就会撞上那条死链、转圈十几秒。
+        // 体检结论（{@link SourceAudit}）在这里才有价值：只要这一档还有
+        // 一条活着的线路，就选它。
+        Map<String, Integer> rep = new LinkedHashMap<>();
+        Set<String> deadTier = new LinkedHashSet<>();
+        List<Integer> unknownIdx = new ArrayList<>();
         for (int i = 0; i < c.sources.size(); i++) {
-            String key = c.sources.get(i).displayKey();
+            Channel.Source s = c.sources.get(i);
+            String key = s.displayKey();
             if (key.isEmpty()) {
-                if (firstUnknown < 0) {
-                    firstUnknown = i;
-                }
+                unknownIdx.add(i);
                 continue;
             }
-            if (!best.containsKey(key)) {
-                best.put(key, i);
+            Integer have = rep.get(key);
+            if (have == null) {
+                rep.put(key, i);
+                if (SourceAudit.isBad(s.url)) {
+                    deadTier.add(key);
+                }
+            } else if (SourceAudit.isBad(c.sources.get(have).url)
+                    && !SourceAudit.isBad(s.url)) {
+                // 现有代表已证伪、这条还能用 ⇒ 换掉
+                rep.put(key, i);
+                deadTier.remove(key);
             }
+        }
+        // "自动"这一档：取第一条没被证伪的未知线路
+        int unknownRep = -1;
+        for (int i : unknownIdx) {
+            if (!SourceAudit.isBad(c.sources.get(i).url)) {
+                unknownRep = i;
+                break;
+            }
+        }
+        if (unknownRep < 0 && !unknownIdx.isEmpty()) {
+            unknownRep = unknownIdx.get(0);
+            deadTier.add(UNKNOWN_ROW_LABEL);
         }
         // 面板是"选分辨率"，顺序必须按<b>分辨率高低</b>，不能沿用线路排序。
         //
@@ -1898,15 +2100,24 @@ public class MainActivity extends Activity {
         // 一条可信的 720P 会排在一条无代号的 1080P 前面。把这个顺序照搬到面板上，
         // 用户看到的就是 720P / 1080P / 576P 这种乱序（实测确实如此），
         // 而选分辨率的菜单应该一眼看出哪档最高。
-        List<String> keys = new ArrayList<>(best.keySet());
+        List<String> keys = new ArrayList<>(rep.keySet());
         Collections.sort(keys, (a, b) -> Channel.rank(b) - Channel.rank(a));
+        // 整档线路都已被证伪的，直接不出现——菜单里不该有"点了必然黑屏"的选项。
+        // 但若所有档位都死了（这个台整体坏掉），仍要把它们显示出来并置灰：
+        // 否则面板是一片空白，用户以为界面坏了。
+        boolean allDead = deadTier.size() == rep.size()
+                && (unknownRep < 0 || deadTier.contains(UNKNOWN_ROW_LABEL));
         for (String key : keys) {
-            addQualityRowItem(key, best.get(key), key.equals(currentLabel));
+            if (!allDead && deadTier.contains(key)) {
+                continue;
+            }
+            addQualityRowItem(key, rep.get(key), key.equals(currentLabel),
+                    !deadTier.contains(key));
         }
         boolean onUnknown = c.source(sourceIndex).displayKey().isEmpty();
-        if (firstUnknown >= 0) {
-            int target = onUnknown ? nextUnknown(c, sourceIndex) : firstUnknown;
-            addQualityRowItem(UNKNOWN_ROW_LABEL, target, onUnknown);
+        if (unknownRep >= 0 && (allDead || !deadTier.contains(UNKNOWN_ROW_LABEL))) {
+            int target = onUnknown ? nextUnknown(c, sourceIndex) : unknownRep;
+            addQualityRowItem(UNKNOWN_ROW_LABEL, target, onUnknown, !allDead);
         }
         // 面板开着时重建了视图（用户刚选了另一档），焦点会随旧视图一起没掉，
         // 不补回来的话上面板立刻"失灵"，还得再按一次右键。
@@ -1954,8 +2165,19 @@ public class MainActivity extends Activity {
      * 竖排时整行才看得出"这是一行选项"；胶囊宽度不一反而参差。
      */
     private void addQualityRowItem(String text, int index, boolean active) {
+        addQualityRowItem(text, index, active, true);
+    }
+
+    /**
+     * 清晰度面板的一行。
+     *
+     * @param verified {@code false} 表示这一档的所有线路都已被体检证伪。
+     *                 仍要显示（否则整台坏掉时面板会空白），但文字压暗，
+     *                 让用户一眼看出"这一档现在没戏"，而不是点下去等黑屏。
+     */
+    private void addQualityRowItem(String text, int index, boolean active, boolean verified) {
         TextView item = new TextView(this);
-        item.setText(text);
+        item.setText(verified ? text : text + " ✕");
         // 规则 4 把面板收窄到 16% 后字号要跟着收一档，
         // 否则 `1080P` 五个字符会把整行撑满、没有呼吸空间
         UiScale.text(item, 22);
@@ -1965,6 +2187,7 @@ public class MainActivity extends Activity {
         item.setBackgroundResource(R.drawable.quality_row_bg);
         UiScale.padding(item, 8, 12, 8, 12);
         item.setSelected(active);
+        item.setAlpha(verified ? 1f : 0.42f);
         item.setClickable(true);
         item.setFocusable(true);
         // 同 item_channel.xml：触摸模式下 requestFocus 会被拒绝，
@@ -2219,6 +2442,8 @@ public class MainActivity extends Activity {
             bufferUi.showNow();
         }
         speed.reset();
+        auditHeadroom = false;
+        auditOkAt = 0;
         LiveSpeedMeter.INSTANCE.reset();
         // 重新渲染信息条让选中态跟上用户的选择
         renderTopLogo(c);
@@ -2385,6 +2610,21 @@ public class MainActivity extends Activity {
 
     private void select(int position) {
         if (position < 0 || position >= channels.size()) {
+            return;
+        }
+        Channel picked = channels.get(position);
+        // 用户选的就是<b>正在播的那个台</b>：什么都不用做，直接收菜单。
+        //
+        // 原来的写法无条件 `sourceIndex = 0; play(position)`——等于把画面
+        // 整个重建一遍：清缓冲、重新探测、重新等首帧、缓冲圈又转一次。
+        // 用户的意图只是"我看看列表，还是这个台"，给他一次无谓的黑屏
+        // 是最难解释的体验。这里按名字比（不是按下标）：refresh 之后
+        // 是另一批 Channel 对象，按下标可能指到别的台上。
+        if (!TextUtils.isEmpty(playingName) && playingName.equals(picked.name)
+                && playingRef != null && player != null) {
+            android.util.Log.i("IPTVPLAY", "select-current ch=" + picked.name
+                    + ", just closing menu");
+            closeMenu();
             return;
         }
         sourceIndex = 0;
@@ -2663,6 +2903,12 @@ public class MainActivity extends Activity {
         // 先把当前台和相邻几台的"起播几秒"抓到磁盘里，
         // 真正按下去时首帧几乎是瞬时的。
         prefetchAround(current >= 0 ? current : 0);
+
+        // 菜单里每个选项都要保证"点了能播"。体检（SourceAudit）只在
+        // 带宽有余量时跑，这里把<b>正在播的这台</b>排到队首（它的档位
+        // 马上要显示在右侧面板上），再把当前分组其余线路排进普通队列轮着测。
+        SourceAudit.prioritize(this, playingRef);
+        SourceAudit.rotate(this, channels);
     }
 
     /** 收起整个菜单：三块一起走，不留半套 UI（规则 1）。 */
@@ -3015,6 +3261,11 @@ public class MainActivity extends Activity {
         // 焦点落在哪一行，用户下一步最可能看的就是它（或者它上下相邻的台）。
         // 提前把这几路的"起播几秒"抓进磁盘缓存，真按下去时首帧几乎是瞬时的。
         prefetchAround(position);
+        // 焦点所在的台也可能马上被选中，先把它的线路排进体检队首：
+        // 用户停在它上面看的就是右侧那几档清晰度，档位有没有活线要能立刻看出来。
+        if (position < channels.size()) {
+            SourceAudit.prioritize(this, channels.get(position));
+        }
         ui.post(() -> {
             View row = listManager == null ? null : listManager.findViewByPosition(position);
             if (row == null) {

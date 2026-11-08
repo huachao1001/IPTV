@@ -517,6 +517,81 @@ nowMeta    bounds=[187,17][1144,36]
 "该频道暂时无法播放"，也好过频道直接从节目单里蒸发——后者会让分组里
 少一个台，用户以为节目单坏了。
 
+#### 规则 6 的补强：菜单里每个选项都要当场可播（`SourceAudit`）
+
+死线路黑名单只解决"播失败过的会被剔掉"。用户更直接的诉求是：
+**打开菜单，点哪一档就得能播，不能点了才发现无效。** 这需要预先体检。
+
+`SourceAudit`（`source/` 包）把"这条线路能不能出数据"变成可查询的事实，
+四条边界必须记住：
+
+| 边界 | 内容 |
+|------|------|
+| 只判**连通性** | 取清单 → 取第一个分片出字节。**不判快慢**：能不能喂动 1080 只能靠真实播放判定 |
+| 判死**不写** `DeadSources` | 两者证据强度不同（一次速度探测会误杀好源），混用会把好源永久拉黑 |
+| 只在**带宽有余量**时跑 | 起播/卡顿期间整个停手，否则和正在播的那路抢带宽 |
+| 结论**只在内存** | `OK_TTL_MS = 15min` / `BAD_TTL_MS = 10min`。坏源不能给太短的 TTL：过期就重新入队，太短会让一批死链被无限重测、白吃好源的验证带宽 |
+
+##### 余量判据：按「速率 vs 码率需求」，不是「缓冲厚度」
+
+**这是本轮最关键的一处修正。** 早先判据是 `buffered > 8000ms`，
+但很多源的分片窗口本身只有 3~5 秒（实测模拟器 `buffered` 峰值 5.3 秒），
+缓冲永远到不了 8 秒 —— **体检一次都不会跑**，
+"菜单里每个选项都有活线"这个承诺等于没做（表现为面板永远显示"未知"）。
+
+现在是：
+
+```
+实测下载速率 ÷ 这路流的码率需求 ≥ 1.6 倍 → 有余量
+                              <  1.3 倍 → 收手
+```
+
+- 滞回带 1.3~1.6 防止阈值附近每秒开关一次；
+- 码率需求来自 `onLoadCompleted` 的 `MediaLoadData.mediaEndTimeMs - mediaStartTimeMs`
+  （**不是** `mediaDurationUs`，`MediaLoadData` 没有这个字段，编译直接过不去）；
+- 拿不到 mediaDuration（裸流）才退回看 `AUDIT_MIN_BUFFER_MS = 8000`。
+
+##### 关闭必须宽限 6 秒（`AUDIT_OFF_GRACE_MS`）
+
+分片边界那一两秒里，测速的 4 秒窗口会被排空（读数变 "—"），
+**同时**播放器常掉进 `STATE_BUFFERING` —— 这恰恰是"上一个分片播完、
+下一个还没到"的正常节奏，不是卡顿。
+
+早先把 `!eligible` 当成硬证据立刻关，实测每 5~6 秒开关一次（每个分片一遍），
+探测线程每次读两三秒就被打断，一条都测不完。现在统一宽限 6 秒，
+但**前提是"上一次确实有余量"**（`auditOkAt`）；起播那几秒不放行。
+
+##### `ABORTED = -2`：被打断不是结论
+
+`probe()` / `sample()` / `readText()` 因让路提前返回时给 `ABORTED`，
+`loop()` 只把它**放回队尾**：
+
+- **不下任何结论**（混成 `-1` 会把好源判死）；
+- **也不能从队列拿掉**（早先是 `QUEUED.remove`）——拿掉等于回到"从没测过"，
+  而重新入队只发生在开菜单/移动焦点时。弱网下被让路是常态
+  （实测 10 条里有 2~3 条 defer），结果是那几条永远显示不出来。
+
+##### 两个队列与调度
+
+| 队列 | 内容 |
+|------|------|
+| `FRONT` | 用户正看的台（`prioritize`），队首 |
+| `BACK` | 当前分组其余线路（`rotate`），轮着测 |
+
+并发 `THREADS = 2`、`MAX_QUEUE = 400`、`ROTATE_BATCH = 24`。
+
+##### 结论怎么落到界面
+
+- 右侧面板：`renderQualityPanel()` 按体检结论挑**每档的可用代表线路**，
+  整档全死的档位**不显示**；全台全死才全部显示 + 压暗 + `" ✕"`。
+- 频道行胶囊：`ChannelAdapter.bindQualities()` 对死档压暗 + `✕`。
+- 选源：`quickestSource()` / `SourceProber.pickBlocking` / `pickBetterBlocking`
+  都跳过 `SourceAudit.isBad()` 的线路。
+- 播起来就 `markPlaying(url)`（`STATE_READY` 里调）。
+- `refreshMenuHealth()` 有 **900ms 防抖**（`HEALTH_REFRESH_MS`）：
+  体检每出一条结论就 `removeAllViews()` + `notifyDataSetChanged()`
+  会让列表反复重排，滚动和焦点都被"按住不动"，观感是卡一下卡一下。
+
 #### 规则 6：每次启动都刷新
 
 `refreshIfStale()`（只在缓存过期 24h 时才拉）已换成 `refreshInBackground()`：
@@ -915,7 +990,7 @@ DefaultMediaSourceFactory(PlaybackCache.factory(ctx)))`。
 - [ ] 第二次切回同一台走记忆线路、明显更快
 - [ ] 换台后不再冻屏（`resetForNewStream` 生效）
 - [ ] 坏台（CETV-1）4 轮后放弃并提示
-- [ ] 抽屉内焦点移动能看到预览卡
+- [ ] 菜单里每档都能出画面（体检结论在真机网络下的准确率）
 
 #### 七条菜单规则：模拟器已回归（2026-11-08）
 
@@ -942,6 +1017,64 @@ DefaultMediaSourceFactory(PlaybackCache.factory(ctx)))`。
 > 模拟器无 MP2 解码器（有画面无声音），且远程源只能连 `gh-proxy.com`，
 > 分组名是英文 `General` 而非内置 seed 的中文分组。
 
+#### 本轮（菜单每档都要有效 / 点当前台直接收菜单 / 图标）
+
+`build/t_audit.py` 四段全 PASS（2026-11-08 模拟器）：
+
+| 项 | 结论 | 证据 |
+|----|------|------|
+| 再次选中在播的台 → 只收菜单 | ✅ | 日志 `IPTVPLAY select-current ch=CCTV-6, just closing menu`；播放次数 `1 -> 1`（没有重新起播） |
+| 面板里每档都有活线 | ✅ | CCTV-6 的 720P 整档全死 → 面板只剩 `['1080P','576P','自动']` |
+| 体检在余量时真跑 | ✅ | 20 秒内 25 条结论；`headroom on speed=41.9 MB/s need=317 KB/s` |
+| 菜单开合 / 左右面板回归 | ✅ | BACK 收起 + OK 打开 + `drawer`/`qualityPanel` 都在 |
+
+回归：`t_base2.py`(A/B/C/D)、`t_final1.py`(规则 2 + 一致性 + 跨分组)、
+`t_qual.py`、`t_prefetch.py`、`t_logo.py`(全屏只 1 个 `ImageView`) 全 PASS。
+
+##### 「点当前台直接收菜单」为什么要单独做
+
+用户在菜单里再次选中**正在播的那个台**，程序本来会走完整 `play()`：
+清空播放器、重新探测线路、重新缓冲。用户看到的是"我就点了一下，
+怎么黑屏重来了"。现在 `select(int)` 一开始就比对名字：
+
+```java
+if (picked.name.equals(playingName)) {
+    closeMenu();   // 只收菜单，什么都不重开
+    return;
+}
+```
+
+判据必须是**名字**而不是下标：`current` 只是列表焦点行，
+浏览过别的分组之后它和"正在播的台"根本不是一回事（见上文语义拆解）。
+
+##### 图标：Android 6 用不到矢量图（重要）
+
+电视是 **Android 6.0.1**，**不支持 adaptive icon**（需 8.0+）。
+`mipmap-anydpi-v26/ic_launcher.xml` 里那份矢量前景**从来没有生效过**，
+真正用的是 `mipmap-{mdpi..xxxhdpi}/ic_launcher.png`。
+所以"改了矢量图但桌面没变"不是缓存问题，是**改错了文件**。
+
+现在图标由 `build/make_icons.py` 生成（Pillow，**4 倍超采样 + LANCZOS** 下采样，
+`FILL_RATIO = 0.80`），重跑即可重绘全部 10 个 PNG
+（`ic_launcher{,_round}.png` × 5 档）。波形必须**分段画折线 + 每个采样点补圆点**，
+不能用 `joint="curve"`（会画出放射状毛刺）。
+
+验证方式只有一个：**桌面截图**（`build/_home_icon2.png`）。
+装完 APK 不重绘桌面缓存也正常，多看一次即可。
+
+##### 测试脚本的两个致命陷阱（都踩过）
+
+1. **不能读顶栏 `nowName` 判"在播哪个台"**。顶栏 `HIDE_BAR_MS = 6000`，
+   而 `uiautomator dump` 要等主线程空闲（换台时正跑阻塞探测好几秒），
+   等它返回顶栏已自动隐藏 —— 读到空串，把成功误判成失败。
+   一律读 `IPTVCH play ch=` 日志（`play()` 里打，不受界面计时影响）。
+2. **logcat 环形缓冲会被体检日志冲爆**。默认 `main` 只有 256KB，
+   而 `IPTVAUDIT` 一次会话有几百行，很快把 `IPTVCH` 挤掉，读到的也是空串。
+   脚本开头必须 `adb logcat -G 8M`（`rc.ensure_log_room()`）。
+
+另外 `names()` 只返回**屏幕上可见的行**，列表按规则 5 会把选中行滚到正中，
+所以"分组第 1 个台"未必是可见第一行。要读分组顺序必须先按 UP 退到顶。
+
 ---
 
 ## 四、调试工具
@@ -964,12 +1097,26 @@ $adb="D:\Software\Android\sdk\platform-tools\adb.exe"
 
 | TAG | 内容 |
 |-----|------|
+| `IPTVAUDIT` | 线路体检：`headroom on/off speed=.. need=..`、`ok/bad/defer <url>`、`prioritize`、`rotate` |
+| `IPTVCH` | **当前在播哪个台**（`play ch=<name> idx=<n>`）。自动化脚本判"换台成功"只认这一行 |
 | `IPTVPROBE` | 每路实测速率/需求/得分、最终选源决策、精修收益 |
-| `IPTVPLAY` | 2 秒一次播放器状态（state/buffered/pos/audio）+ refine 换线 |
+| `IPTVPLAY` | 2 秒一次播放器状态（state/buffered/pos/audio）+ refine 换线 + `select-current` |
 | `IPTVSTALL` | 起播超时、放弃换线 |
-| `IPTVLOAD` | 每个分片的字节数与耗时、分片跳号 |
+| `IPTVQUAL` | 清晰度上限 / 手动选档 / 降档原因（`why=`） |
+| `IPTVLOAD` | 每个分片的字节数、耗时、**实测速率与码率需求**、分片跳号 |
+| `IPTVBUBBLE` | 缓冲圈显隐决策（`show first-play` / `suppressed short bubble` / `show after 1200ms`） |
+| `IPTVCACHE` | 磁盘缓存与预取（`cache ready` / `prefetch ok segs=`） |
+| `IPTVVERIFY` | 旧线路复验（`old-line ok= dead= total=`） |
 | `IPTVVIDEO` | 重复帧剔除、掉帧 |
 | `IPTVAUDIO` | MP2/MP3/AAC 解码器探测结果 |
+
+**抓日志前先给缓冲扩容**：`& $adb logcat -G 8M`。
+默认 `main` 只有 256KB，体检日志几百行就能把 `IPTVCH` 挤掉（实测踩过）。
+脚本里走 `rc.ensure_log_room()`。
+
+**判"在播哪个台"绝不要读顶栏 `nowName`**：`HIDE_BAR_MS = 6000`，
+而 `uiautomator dump` 要等主线程空闲（换台时正卡在阻塞探测上），
+等它返回顶栏已经隐藏，读到空串会把成功误判成失败。读 `IPTVCH`。
 
 分片分析脚本（Python，需手动下载分片）：
 
@@ -992,3 +1139,9 @@ $py="$env:USERPROFILE\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\
    `SourceMemory` 存的是 URL 而非下标，避免排序后错位。
 5. **电视无 `su`、无 `curl`**：不能改 `/sys/class/display/mode`，
    也不能直接命令行测源，只能靠应用内探测日志。
+6. **`MediaLoadData` 没有 `mediaDurationUs`**。想拿分片覆盖的媒体时长，
+   只能用 `mediaEndTimeMs - mediaStartTimeMs`（`Us` 那个字段在别的类里）。
+7. **`java -cp *.aar` 读不到类**：aar 其实是 zip，先改后缀解压再 `javap -classpath classes.jar`。
+8. **`am start` 不会重跑 `play()`**：应用已在跑时它只把任务提到前台，
+   于是没有新的 `IPTVCH`。脚本要读在播台必须先 `am force-stop` 再 `am start`。
+9. **图标改矢量图在 Android 6 上无效**：见上文「图标：Android 6 用不到矢量图」。

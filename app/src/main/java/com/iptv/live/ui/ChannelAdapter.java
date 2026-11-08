@@ -185,25 +185,50 @@ public class ChannelAdapter extends RecyclerView.Adapter<ChannelAdapter.VH> {
         /** 底部一行只展示清晰度，可横向滑动。 */
         void bindQualities(Channel c, boolean active) {
             metaRow.removeAllViews();
-            Set<String> seen = new java.util.LinkedHashSet<>();
+            // 每档一个胶囊。已经被线路体检证伪的档位压暗 + 加 ✕：
+            // 用户还没按下去就知道这一档现在没戏，而不是点了等黑屏。
+            java.util.Map<String, Boolean> tiers = new java.util.LinkedHashMap<>();
             for (Channel.Source s : c.sources) {
                 String key = s.displayKey();
-                if (!key.isEmpty()) {
-                    seen.add(key);
+                if (key.isEmpty()) {
+                    continue;
+                }
+                Boolean alive = tiers.get(key);
+                boolean thisAlive = !com.iptv.live.source.SourceAudit.isBad(s.url);
+                if (alive == null) {
+                    tiers.put(key, thisAlive);
+                } else if (!alive && thisAlive) {
+                    tiers.put(key, true);
                 }
             }
-            for (String label : seen) {
-                addChip(label, 0xFF3D6FB8);
+            if (tiers.isEmpty()) {
+                tiers.put("自动", !allBad(c));
             }
-            if (seen.isEmpty()) {
-                addChip("自动", 0xFF4A5568);
+            for (java.util.Map.Entry<String, Boolean> e : tiers.entrySet()) {
+                boolean alive = e.getValue();
+                addChip(alive ? e.getKey() : e.getKey() + " ✕",
+                        alive ? 0xFF3D6FB8 : 0xFF4A5568, alive);
             }
             if (active) {
-                addChip("正在播放", 0xFF2E9E63);
+                addChip("正在播放", 0xFF2E9E63, true);
             }
         }
 
+        /** 这个台是不是一条能出数据的线路都没有了。 */
+        private static boolean allBad(Channel c) {
+            for (Channel.Source s : c.sources) {
+                if (!com.iptv.live.source.SourceAudit.isBad(s.url)) {
+                    return false;
+                }
+            }
+            return !c.sources.isEmpty();
+        }
+
         private void addChip(String text, int color) {
+            addChip(text, color, true);
+        }
+
+        private void addChip(String text, int color, boolean solid) {
             TextView t = new TextView(ctx);
             t.setText(text);
             UiScale.text(t, 22);
@@ -213,6 +238,9 @@ public class ChannelAdapter extends RecyclerView.Adapter<ChannelAdapter.VH> {
             int px = UiScale.pxW(14);
             int py = UiScale.pxH(4);
             t.setPadding(px, py, px, py);
+            if (!solid) {
+                t.setAlpha(0.45f);
+            }
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
             lp.rightMargin = UiScale.pxW(8);

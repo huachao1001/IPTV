@@ -314,37 +314,12 @@ public final class PlaybackCache {
     /**
      * 把清单里的相对地址补成绝对地址。
      *
-     * <p>{@code android.net.Uri} 没有 {@code resolve} 方法，只能自己算：
-     * 以最后一个 {@code /} 为界拼相对路径。顺便处理 {@code //host/path}
-     * 这种协议相对写法和 {@code ?query} 这种绝对查询串——节目单里三种都出现过。
+     * <p>实现已收进 {@link com.iptv.live.source.HlsUrls}：预取和线路体检
+     * 都要做同一件事，两处各写一份迟早不一致。
      */
     @Nullable
     private static String resolve(String base, String rel) {
-        if (rel.startsWith("http://") || rel.startsWith("https://")) {
-            return rel;
-        }
-        try {
-            if (rel.startsWith("//")) {
-                int colon = base.indexOf("://");
-                String scheme = colon > 0 ? base.substring(0, colon + 1) : "http:";
-                return scheme + rel;
-            }
-            int q = rel.indexOf('?');
-            String pathPart = q >= 0 ? rel.substring(0, q) : rel;
-            String queryPart = q >= 0 ? rel.substring(q) : "";
-            String dir;
-            if (pathPart.startsWith("/")) {
-                // 站内绝对路径：从 base 的 scheme://host 之后接上
-                int afterHost = base.indexOf('/', base.indexOf("://") + 3);
-                dir = afterHost > 0 ? base.substring(0, afterHost) : base;
-            } else {
-                int slash = base.lastIndexOf('/');
-                dir = slash > 0 ? base.substring(0, slash + 1) : base + "/";
-            }
-            return dir + pathPart + queryPart;
-        } catch (Exception e) {
-            return null;
-        }
+        return com.iptv.live.source.HlsUrls.resolve(base, rel);
     }
 
     private static synchronized ExecutorService pool() {

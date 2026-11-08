@@ -235,6 +235,10 @@ public final class SourceProber {
             if (ch.sources.get(i).trust < playingTrust) {
                 continue;
             }
+            // 体检已证伪的不参与精修：它连清单都取不到，探它只会白等超时
+            if (SourceAudit.isBad(ch.sources.get(i).url)) {
+                continue;
+            }
             final int idx = i;
             candidates++;
             probing.add(results.submit(() -> probe(ch.sources.get(idx).url)));
@@ -321,7 +325,8 @@ public final class SourceProber {
         int bestTrust = -1;
         for (int i = 0; i < n; i++) {
             Channel.Source s = ch.sources.get(i);
-            if (i == exclude || Boolean.TRUE.equals(s.starved) || s.effectiveRank() > cap) {
+            if (i == exclude || Boolean.TRUE.equals(s.starved) || s.effectiveRank() > cap
+                    || SourceAudit.isBad(s.url)) {
                 continue;
             }
             if (s.trust > bestTrust) {
@@ -358,6 +363,11 @@ public final class SourceProber {
             }
             // 低可信度的线路留到"高可信度全都不行"时再探
             if (ch.sources.get(i).trust != bestTrust) {
+                continue;
+            }
+            // 已被线路体检证伪（连清单都取不到）的不探：它的结论是 0/1 的
+            // 连通性事实，比一次速度采样硬得多。全被证伪时会走下面的重试分支。
+            if (SourceAudit.isBad(ch.sources.get(i).url)) {
                 continue;
             }
             final int idx = i;
