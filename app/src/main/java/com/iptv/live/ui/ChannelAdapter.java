@@ -1,4 +1,6 @@
-package com.iptv.live;
+package com.iptv.live.ui;
+
+import com.iptv.live.model.Channel;
 
 import android.content.Context;
 import android.graphics.Bitmap;
@@ -18,6 +20,7 @@ import java.io.InputStream;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import com.iptv.live.R;
 
 /** 频道列表适配器，按 TV 遥控器焦点模式工作，同时支持触摸点击。 */
 public class ChannelAdapter extends RecyclerView.Adapter<ChannelAdapter.VH> {
@@ -33,7 +36,15 @@ public class ChannelAdapter extends RecyclerView.Adapter<ChannelAdapter.VH> {
     private final List<Channel> data;
     private final OnPick pick;
     private OnLongPress longPress;
-    private int current = -1;
+    /**
+     * 正在播放的频道名。
+     *
+     * <p><b>必须按名字判断，不能按下标。</b>早先这里存的是"列表选中行下标"，
+     * 而选中行会被强制夹到 0（切到不含正在播频道的分组时找不到，就落到第一行），
+     * 于是第一行被标上"正在播放"——明明播的是别的分组里的台。
+     * 名字跨分组稳定，找不到就一个都不标，这才是实事求是。
+     */
+    private String playingName = "";
 
     /** 图标已随包提供，直接同步解码，避免异步闪烁。 */
     private final Set<String> missingLogos = new HashSet<>();
@@ -48,15 +59,45 @@ public class ChannelAdapter extends RecyclerView.Adapter<ChannelAdapter.VH> {
         this.longPress = l;
     }
 
-    public void setCurrent(int index) {
-        int old = current;
-        current = index;
-        if (old >= 0 && old < data.size()) {
-            notifyItemChanged(old);
+    /**
+     * 设置"正在播放"的频道。
+     *
+     * <p>按<b>名字</b>匹配，不按下标：切到不含正在播频道的分组时，
+     * 列表里一条都不该带"正在播放"标，而不是把第一行误标上去。
+     */
+    public void setPlaying(String name) {
+        String next = name == null ? "" : name;
+        if (playingName.equals(next)) {
+            return;
         }
-        if (index >= 0 && index < data.size()) {
-            notifyItemChanged(index);
+        int oldPos = indexOf(playingName);
+        playingName = next;
+        int newPos = indexOf(playingName);
+        // 新旧位置都要重绘：只刷一个的话另一行的高亮会残留
+        if (oldPos >= 0) {
+            notifyItemChanged(oldPos);
         }
+        if (newPos >= 0 && newPos != oldPos) {
+            notifyItemChanged(newPos);
+        }
+    }
+
+    /** 在 data 里按名字找下标，找不到返回 -1。 */
+    private int indexOf(String name) {
+        if (name == null || name.isEmpty()) {
+            return -1;
+        }
+        for (int i = 0; i < data.size(); i++) {
+            if (name.equals(data.get(i).name)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /** 当前列表里"正在播放"那一行的下标，不在本列表里返回 -1。 */
+    public int playingPosition() {
+        return indexOf(playingName);
     }
 
     @NonNull
@@ -74,8 +115,10 @@ public class ChannelAdapter extends RecyclerView.Adapter<ChannelAdapter.VH> {
         // 行高每次 bind 都固定下来，避免首行沿用 wrap_content 被压扁
         h.applyRowHeight();
         h.bindLogo(c);
-        h.bindQualities(c, position == current);
-        h.itemView.setActivated(position == current);
+        // "正在播放"按名字匹配：不在本分组里就一条都不标（实事求是）
+        boolean playing = !playingName.isEmpty() && playingName.equals(c.name);
+        h.bindQualities(c, playing);
+        h.itemView.setActivated(playing);
         h.itemView.setOnClickListener(v -> pick.onPick(h.getBindingAdapterPosition()));
         h.itemView.setOnLongClickListener(v -> {
             if (longPress == null) {
@@ -178,7 +221,7 @@ public class ChannelAdapter extends RecyclerView.Adapter<ChannelAdapter.VH> {
     }
 
     /** 图标解码结果缓存，列表滚动时不重复解码。 */
-    static final class LogoCache {
+    public static final class LogoCache {
         private static final android.util.LruCache<String, Bitmap> CACHE =
                 new android.util.LruCache<String, Bitmap>(64) {
                     @Override
@@ -187,7 +230,7 @@ public class ChannelAdapter extends RecyclerView.Adapter<ChannelAdapter.VH> {
                     }
                 };
 
-        static Bitmap get(Context ctx, String key) {
+        public static Bitmap get(Context ctx, String key) {
             Bitmap hit = CACHE.get(key);
             if (hit != null) {
                 return hit;

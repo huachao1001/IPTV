@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 清晰度档位行：与左侧分组项 group_bg.xml 同一套语言——
+     焦点态整行实心蓝，选中态淡蓝底 + 蓝描边，10dp 圆角。
+     原来用的是 999dp 胶囊 + 半透明白底，跟左侧菜单完全不是一路。 -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_focused="true">
+        <shape android:shape="rectangle">
+            <solid android:color="#FF3D8BFD" />
+            <corners android:radius="10dp" />
+        </shape>
+    </item>
+    <item android:state_selected="true">
+        <shape android:shape="rectangle">
+            <solid android:color="#2E3D8BFD" />
+            <stroke
+                android:width="1.5dp"
+                android:color="#803D8BFD" />
+            <corners android:radius="10dp" />
+        </shape>
+    </item>
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#00000000" />
+            <corners android:radius="10dp" />
+        </shape>
+    </item>
+</selector>

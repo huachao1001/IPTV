@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 右侧清晰度面板：与左侧 channel_panel_bg 镜像。
+     左侧是"左实右虚"（angle=0，startColor 最实），右侧反过来，
+     屏幕右缘保持实底、向左渐隐，两块浮层的观感才是对称的一套。
+
+     angle=180 在 Android 里表示从右往左：startColor 落在<b>右边</b>。
+     所以 startColor 用最实的 #F70A0E14，endColor 用全透明 —
+     写反就会变成"左边实、右边透",右缘露出一条画面。 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android">
+    <gradient
+        android:angle="180"
+        android:centerColor="#E60B0F16"
+        android:endColor="#000B0F16"
+        android:startColor="#F70A0E14" />
+</shape>

@@ -1,5 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- 频道行：高度和图标尺寸在 ChannelAdapter 里按屏幕等比换算 -->
+<!--
+  focusableInTouchMode 是必须的，不是可选优化：
+  点过屏幕（含虚拟遥控器）后窗口会进入 touch mode，此时普通 focusable 的 View
+  调 requestFocus() 会被静默拒绝，焦点留在 root 上，方向键就彻底没反应了。
+  实测现象：按 OK 打开菜单后上下左右键毫无反应（build/c2.png）。
+-->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/row"
     android:layout_width="match_parent"
@@ -7,6 +13,7 @@
     android:background="@drawable/row_bg"
     android:clipChildren="false"
     android:focusable="true"
+    android:focusableInTouchMode="true"
     android:gravity="center_vertical"
     android:orientation="horizontal"
     android:paddingStart="12dp"

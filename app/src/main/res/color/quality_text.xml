@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 清晰度档位文字：与左侧分组项 group_text.xml 一致，
+     选中/焦点走纯白，其余降到 60% 白 -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:color="#FFFFFF" android:state_selected="true" />
+    <item android:color="#FFFFFF" android:state_focused="true" />
+    <item android:color="#99FFFFFF" />
+</selector>

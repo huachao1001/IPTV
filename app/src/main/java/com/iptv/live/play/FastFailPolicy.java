@@ -1,4 +1,4 @@
-package com.iptv.live;
+package com.iptv.live.play;
 
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy;
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy;

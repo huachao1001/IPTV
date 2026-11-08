@@ -1,4 +1,4 @@
-package com.iptv.live;
+package com.iptv.live.model;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -41,7 +41,7 @@ public class ChannelGroups {
     }
 
     /** 把源里的各种分组写法收敛到统一的名字。 */
-    static String canonical(String group) {
+    public static String canonical(String group) {
         if (group == null || group.trim().isEmpty()) {
             return "其他频道";
         }
@@ -54,10 +54,33 @@ public class ChannelGroups {
             return "影视频道";
         }
         // 节目单里偶发的英文分组名，统一并入其他
-        if ("News".equalsIgnoreCase(g)) {
+        if (isPlaceholderGroup(g)) {
             return "其他频道";
         }
         return g;
+    }
+
+    /**
+     * 节目单里"没填分组"时的占位名。
+     *
+     * <p>上游清单里同一个频道的各条线路分组写法并不统一，其中
+     * {@code General} / {@code News} / {@code Other} / {@code Misc} 这类
+     * 是生成工具塞的英文占位，不是真实归类。它们<b>不能参与分组投票</b>
+     * （否则 CCTV-1 会被那单独一条 {@code General} 带走，单独形成一个分组），
+     * 也不能作为最终分组名（分组栏里冒出英文 Tab）。
+     */
+    public static boolean isPlaceholderGroup(String group) {
+        if (group == null || group.trim().isEmpty()) {
+            return true;
+        }
+        String g = group.trim();
+        return "General".equalsIgnoreCase(g)
+                || "News".equalsIgnoreCase(g)
+                || "Other".equalsIgnoreCase(g)
+                || "Others".equalsIgnoreCase(g)
+                || "Misc".equalsIgnoreCase(g)
+                || "Undefined".equalsIgnoreCase(g)
+                || "Default".equalsIgnoreCase(g);
     }
 
     /** 按预设顺序重排分组，未列出的放在最后。 */

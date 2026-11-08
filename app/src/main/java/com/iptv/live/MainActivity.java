@@ -44,12 +44,30 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
+import com.iptv.live.model.Channel;
+import com.iptv.live.model.ChannelGroups;
+import com.iptv.live.play.LiveSpeedMeter;
+import com.iptv.live.play.LoadSpeedMeter;
+import com.iptv.live.play.PlaybackTuning;
+import com.iptv.live.play.StallDetector;
+import com.iptv.live.source.ChannelStore;
+import com.iptv.live.source.DailyRefresh;
+import com.iptv.live.source.DeadSources;
+import com.iptv.live.source.QualityCap;
+import com.iptv.live.source.QualityMemory;
+import com.iptv.live.source.SourceMemory;
+import com.iptv.live.source.SourceProber;
+import com.iptv.live.ui.BufferingIndicator;
+import com.iptv.live.ui.ChannelAdapter;
+import com.iptv.live.ui.CenteringLayoutManager;
+import com.iptv.live.ui.GroupAdapter;
+import com.iptv.live.ui.UiScale;
+import com.iptv.live.ui.VirtualRemote;
+
 /** 直播主界面：全屏播放 + 分组导航抽屉 + 清晰度落地窗。 */
 public class MainActivity extends Activity {
 
     private static final long HIDE_BAR_MS = 6000;
-    /** 底部信息条常驻时长：到时下滑隐藏，不长期占画面。 */
-    private static final long HIDE_INFO_BAR_MS = 5000;
     /** 卡顿判定阈值：只用于内部状态记账，不再弹提示。 */
     private static final long STALL_LIMIT_MS = 6000;
     /** 卡死检测的轮询间隔。 */
@@ -70,6 +88,14 @@ public class MainActivity extends Activity {
     private static final int STARVED_SKIP_LIMIT = 2;
     /** 数字键换台的有效输入窗口。 */
     private static final long NUMBER_WINDOW_MS = 1500;
+    /**
+     * 右侧清晰度面板宽度（屏幕宽度的百分比）。
+     *
+     * <p>规则 4：宽度要小。面板里只有 `1080P` 这种四个字符的档位标签，
+     * 26% 会白占掉四分之一画面；16% 在 1080p 上是 307px，
+     * 足够放下四个字加左右呼吸空间，同时把画面让出来。
+     */
+    private static final int RIGHT_PANEL_PCT = 16;
     /** 缓冲区攒到这个时长即视为可以起播，环形进度以此为 100%。 */
     private static final long BUFFER_TARGET_MS = 10_000;
     /** 收藏分组在导航栏的位置。 */
@@ -86,26 +112,39 @@ public class MainActivity extends Activity {
     private PlayerView playerView;
     private BufferingIndicator loading;
     private RecyclerView list;
+    /** 频道列表的布局管理器：负责把当前行滚到垂直正中。 */
+    private CenteringLayoutManager listManager;
+    /**
+     * 频道列表里上一次落焦的行下标。
+     *
+     * <p>居中滚动会把焦点行滚出并回收，此时 {@code getCurrentFocus()}
+     * 已经拿不到它，{@code focusedPosition()} 返回 -1。用它兜住续算
+     * 的基准，否则连续按 DOWN 会在同一行上原地打转。
+     */
+    private int lastFocusPos = -1;
+    /**
+     * 是否正在由 {@link #moveChannelFocusTo(int)} 主动滚动。
+     *
+     * <p>落焦会触发 {@code OnGlobalFocusChangeListener}，那里也会居中一次；
+     * 两处同时发起平滑滚动会互相打断（表现为滚一下停住）。
+     * 主动滚的那一次把标志置位，让监听器这一帧让位。
+     */
+    private boolean smoothScrollPending;
     private RecyclerView groupList;
     private View drawer;
     private View topBar;
-    private View infoBar;
+    /** 正在播放的台标：在左上角顶栏里，紧挨台名（原右下角两个 logo 已合并成这一个）。 */
     private android.widget.ImageView infoLogo;
-    private TextView infoName;
-    private LinearLayout infoQualityRow;
-    private android.widget.HorizontalScrollView infoScroll;
+    /** 右侧清晰度面板：贴屏幕右缘竖排，每个档位一行。 */
+    private LinearLayout qualityPanel;
+    private LinearLayout qualityRow;
+    private android.widget.ScrollView qualityScroll;
     private TextView nowName;
     private TextView nowMeta;
     private TextView clock;
     private TextView hint;
     private TextView drawerSub;
     private TextView emptyTip;
-
-    /** 抽屉内焦点预览卡：显示目标频道的台标与名称。 */
-    private View previewCard;
-    private android.widget.ImageView previewLogo;
-    private TextView previewName;
-    private TextView previewMeta;
 
     /** 全量频道，跨分组保留。 */
     private final List<Channel> master = new ArrayList<>();
@@ -121,7 +160,16 @@ public class MainActivity extends Activity {
     private GestureDetector gestures;
 
     private int currentGroup = 0;
-    /** 当前频道在 channels 里的下标，-1 表示本组内没有正在播放的频道。 */
+    /**
+     * 列表焦点行 / 当前选中的行在 {@link #channels} 里的下标。
+     *
+     * <p><b>它只表示"列表里的位置"，不表示"正在播放哪个台"。</b>
+     * 允许为 -1：切到不含正在播频道的分组时，列表里没有任何一行是
+     * "正在播放"，此时不能把它夹成 0——那会把第一行误标成正在播放，
+     * 且后续所有 {@code channels.get(current)} 都会操作到另一个台。
+     *
+     * <p>"正在播放哪个台"一律看 {@link #playingName}。
+     */
     private int current = -1;
     /**
      * 换台令牌：每次 play() 自增。
@@ -131,8 +179,25 @@ public class MainActivity extends Activity {
      * 只比 current 是不够的——用户可能切走又切回同一个台。
      */
     private int playToken = 0;
-    /** 正在播放的频道名，切分组时用它找回高亮。 */
+    /**
+     * 正在播放的频道名。<b>这是"正在播放"的唯一权威</b>。
+     *
+     * <p>播放相关的逻辑一律通过它取频道（{@link #playingChannel()}），
+     * 不用 {@code channels.get(current)}：current 是列表焦点行，
+     * 用户换到别的分组浏览时它指向的是另一个台，甚至是 -1。
+     */
     private String playingName = "";
+    /**
+     * 正在播放的那个 {@link Channel} <b>实例</b>。
+     *
+     * <p>为什么不能只按名字去 {@code master} 里找：节目单每次刷新都会
+     * 重新解析出<b>全新的 Channel 对象</b>，来源线路的顺序、甚至数量都可能变。
+     * 此刻播放器播的还是旧对象，若让看门狗/降档操作新对象，{@code sourceIndex}
+     * 就会指到另一条 URL 上——"降档后还是卡"、"换源换到没播的那条"都来自这里。
+     *
+     * <p>所以播放相关的逻辑一律操作这个实例；它和 UI 里显示的同名行是两回事。
+     */
+    private Channel playingRef;
     /** 当前频道内第几路流，用于失败换源。 */
     private int sourceIndex = 0;
     private int retryRound = 0;
@@ -261,43 +326,6 @@ public class MainActivity extends Activity {
     private final Runnable clearNumber = () -> numberBuf.setLength(0);
     private final Runnable hideHint = () -> hint.setVisibility(View.GONE);
 
-    /** 底部信息条下滑隐藏：平移出屏幕，而不是突然消失。 */
-    private final Runnable hideInfoBar = () -> {
-        if (infoBar.getVisibility() != View.VISIBLE || inInfoBar()) {
-            return;
-        }
-        if (hint.getVisibility() == View.VISIBLE) {
-            return;
-        }
-        infoBar.animate()
-                .translationY(infoBar.getHeight())
-                .setDuration(220)
-                .withEndAction(() -> {
-                    infoBar.setVisibility(View.GONE);
-                    infoBar.setTranslationY(0f);
-                })
-                .start();
-    };
-
-    /** 亮出底部信息条并重新计时；用户按键或换台都会调到。 */
-    private void showInfoBar() {
-        infoBar.animate().cancel();
-        infoBar.setTranslationY(0f);
-        infoBar.setVisibility(View.VISIBLE);
-        ui.removeCallbacks(hideInfoBar);
-        ui.postDelayed(hideInfoBar, HIDE_INFO_BAR_MS);
-        if (hint.getVisibility() == View.VISIBLE) {
-            hint.post(this::placeHint);
-        }
-    }
-
-    /** 立刻收起底部信息条，抽屉打开时用，避免和面板叠在一起。 */
-    private void hideInfoBarNow() {
-        ui.removeCallbacks(hideInfoBar);
-        infoBar.animate().cancel();
-        infoBar.setTranslationY(0f);
-        infoBar.setVisibility(View.GONE);
-    }
 
     /**
      * 缓冲期间刷新环形进度。
@@ -368,7 +396,10 @@ public class MainActivity extends Activity {
             lastBuffered = 0;
             lastBufferedAt = now;
             retryRound = 0;
-            startPlayback(channels.get(current));
+            Channel c = playingChannel();
+            if (c != null) {
+                startPlayback(c);
+            }
         }
     };
     /** 起播超时：准备这么久仍未出画面，就判定这条线路不行，换下一条。 */
@@ -457,10 +488,11 @@ public class MainActivity extends Activity {
      * 并且落在直播边缘附近（{@code TARGET_OFFSET_MS}），不会重播任何内容。
      */
     private void onSilentStall(ExoPlayer p) {
-        if (current < 0 || current >= channels.size()) {
+        // 用"正在播放的频道"，不是列表焦点行：用户可能正浏览别的分组
+        Channel c = playingChannel();
+        if (c == null) {
             return;
         }
-        Channel c = channels.get(current);
         android.util.Log.w("IPTVSTALL", "silent-stall ch=" + c.name
                 + " pos=" + p.getCurrentPosition()
                 + " posStalledMs=" + stallDetector.lastTriggerPosMs()
@@ -519,16 +551,19 @@ public class MainActivity extends Activity {
                 ui.postDelayed(this, STARTUP_POLL_MS);
                 return;
             }
-            if (current < 0 || current >= channels.size()) {
+            Channel c = playingChannel();
+            if (c == null) {
                 return;
             }
-            Channel c = channels.get(current);
             Channel.Source s = c.source(sourceIndex);
             android.util.Log.w("IPTVSTALL", "startup-timeout ch=" + c.name
                     + " idx=" + sourceIndex + " waited=" + waited
                     + " buffered=" + player.getTotalBufferedDuration());
             // 这条线路起不来，记成喂不饱，下次不再优先选它
             s.starved = Boolean.TRUE;
+            // 规则 6：落盘成黑名单，下次加载节目单直接剔除，
+            // 换台时不再反复踩这条死源
+            DeadSources.markDead(MainActivity.this, s.url);
             SourceMemory.remove(MainActivity.this, c.name);
             startupFailures++;
             if (startupFailures >= STARTUP_GIVE_UP_ROUNDS) {
@@ -601,7 +636,8 @@ public class MainActivity extends Activity {
      * 不打断播放——反复缓冲虽然难受，也好过把能看的画面打断。
      */
     private void noteRebuffer() {
-        if (current < 0 || current >= channels.size()) {
+        Channel c = playingChannel();
+        if (c == null) {
             return;
         }
         long now = System.currentTimeMillis();
@@ -616,7 +652,6 @@ public class MainActivity extends Activity {
         }
         rebufferCount = 0;
         rebufferWindowAt = now;
-        Channel c = channels.get(current);
         android.util.Log.w("IPTVSTALL", "rebuffer-heavy ch=" + c.name
                 + " times=" + REBUFFER_LIMIT
                 + " in=" + (REBUFFER_WINDOW_MS / 1000) + "s"
@@ -700,12 +735,15 @@ public class MainActivity extends Activity {
                 chunkSkips++;
                 android.util.Log.w("IPTVLOAD", "chunk-jump " + lastChunkSeq + " -> " + seq
                         + " skips=" + chunkSkips);
-                if (chunkSkips >= STARVED_SKIP_LIMIT
-                        && current >= 0 && current < channels.size()) {
-                    Channel ch = channels.get(current);
+                if (chunkSkips >= STARVED_SKIP_LIMIT) {
+                    Channel ch = playingChannel();
+                    if (ch == null || ch.sources.isEmpty()) {
+                        return;
+                    }
                     Channel.Source s = ch.source(sourceIndex);
                     s.starved = Boolean.TRUE;
                     android.util.Log.w("IPTVLOAD", "starved url=" + s.url);
+                    DeadSources.markDead(MainActivity.this, s.url);
                     chunkSkips = 0;
                     lastChunkSeq = seq;
                     // 这条线路喂不动：先降一档清晰度再重挑。
@@ -861,10 +899,10 @@ public class MainActivity extends Activity {
      * 降档后若 {@code src} 又变回 1080，就说明"不许弹回"的链路有漏洞。
      */
     private String qualityState() {
-        if (current < 0 || current >= channels.size()) {
+        Channel c = playingChannel();
+        if (c == null) {
             return "-";
         }
-        Channel c = channels.get(current);
         int cap = QualityCap.capRank(this, c.name);
         String capText = cap == Integer.MAX_VALUE ? "max" : String.valueOf(cap);
         String src = c.source(sourceIndex).label();
@@ -883,11 +921,10 @@ public class MainActivity extends Activity {
         loading = findViewById(R.id.loading);
         drawer = findViewById(R.id.drawer);
         topBar = findViewById(R.id.topBar);
-        infoBar = findViewById(R.id.infoBar);
         infoLogo = findViewById(R.id.infoLogo);
-        infoName = findViewById(R.id.infoName);
-        infoQualityRow = findViewById(R.id.infoQualityRow);
-        infoScroll = findViewById(R.id.infoScroll);
+        qualityPanel = findViewById(R.id.qualityPanel);
+        qualityRow = findViewById(R.id.qualityRow);
+        qualityScroll = findViewById(R.id.qualityScroll);
         nowName = findViewById(R.id.nowName);
         nowMeta = findViewById(R.id.nowMeta);
         clock = findViewById(R.id.clock);
@@ -896,18 +933,20 @@ public class MainActivity extends Activity {
         emptyTip = findViewById(R.id.emptyTip);
         list = findViewById(R.id.list);
         groupList = findViewById(R.id.groupList);
-        previewCard = findViewById(R.id.previewCard);
-        previewLogo = findViewById(R.id.previewLogo);
-        previewName = findViewById(R.id.previewName);
-        previewMeta = findViewById(R.id.previewMeta);
 
         // 左栏分组导航
         groupList.setLayoutManager(new LinearLayoutManager(this));
         groupAdapter = new GroupAdapter(groupNames, this::onGroupPicked);
         groupList.setAdapter(groupAdapter);
 
-        // 右栏频道列表
-        list.setLayoutManager(new LinearLayoutManager(this));
+        // 右栏频道列表：用居中的布局管理器。
+        //
+        // 默认 LinearLayoutManager 只在"行被裁掉"时才滚，且滚到"刚好露出来"，
+        // 结果焦点走到视口底部几行后就卡死（下一行只露出十几像素，
+        // 焦点搜索找得到它却跳不过去；实测连续 DOWN 到第 5 行后 bounds 完全不变）。
+        // 居中滚动同时解决"焦点卡死"和"看不到下一个频道"两件事。
+        listManager = new CenteringLayoutManager(this);
+        list.setLayoutManager(listManager);
         adapter = new ChannelAdapter(channels, this::select);
         adapter.setOnLongPress(this::showChannelMenu);
         list.setAdapter(adapter);
@@ -916,13 +955,18 @@ public class MainActivity extends Activity {
         // 让列表首尾留白，第一行不被标题压住，最后一行不被屏幕边缘切掉
         list.setClipToPadding(true);
         list.setPadding(UiScale.pxW(12), UiScale.pxH(26), UiScale.pxW(12), UiScale.pxH(24));
-        setupFocusPreview();
+        // 原来这里还挂了一套"焦点预览台标"，已删除（右下角曾同时出现两个 logo）。
+        // 现在只保留焦点行居中这一件事。
+        setupFocusCentering();
 
         findViewById(R.id.btnSettings).setOnClickListener(v -> showSettings());
-        findViewById(R.id.btnClose).setOnClickListener(v -> closeDrawer());
+        findViewById(R.id.btnClose).setOnClickListener(v -> closeMenu());
         findViewById(R.id.btnDrawerSettings).setOnClickListener(v -> showSettings());
         applyScaleToViews();
         setupGestures();
+        // 调试包才有：屏幕上叠一组方向键/OK/返回，走和实体遥控器完全相同的
+        // dispatchKeyEvent 路径。release 包在 attach 内部直接返回，不留任何视图。
+        VirtualRemote.attach(this, (android.view.ViewGroup) findViewById(R.id.root));
 
         if (PREVIEW_ONLY) {
             // 纯预览：播放器整个移除，画面位置只留静态图
@@ -986,9 +1030,12 @@ public class MainActivity extends Activity {
                         disarmStartupWatchdog();
                         rebufferStart = 0;
                         // 这一路真的播起来了，记下来供下次换台秒起播
-                        if (current >= 0 && current < channels.size()) {
-                            Channel c = channels.get(current);
+                        Channel c = playingChannel();
+                        if (c != null) {
                             SourceMemory.put(MainActivity.this, c.name, c.url(sourceIndex));
+                            // 能播起来就说明它不是死源：撤销之前可能留下的黑名单，
+                            // 免得一次误判（比如临时断网）把它永久剔掉
+                            DeadSources.revive(MainActivity.this, c.url(sourceIndex));
                         }
                     }
                 }
@@ -1032,7 +1079,8 @@ public class MainActivity extends Activity {
         ui.post(tick);
         if (!PREVIEW_ONLY) {
             ui.post(silentStallTick);
-            refreshIfStale();
+            // 规则 6：每次打开都在后台刷新，顺带剔除已证伪的坏线路
+            refreshInBackground();
         }
     }
 
@@ -1095,42 +1143,33 @@ public class MainActivity extends Activity {
         UiScale.padding(hint, 26, 12, 26, 12);
         UiScale.margin(hint, 0, 0, 0, 18);
 
-        // 底部信息条
-        UiScale.padding(infoBar, 34, 16, 34, 16);
-        // 台标已归一化成 2:1；底板四边留等宽间隙，图标才能水平垂直都居中
-        int logoH = UiScale.pxH(96);
+        // 左上角台标：和台名同排，高一点但不能盖过顶栏。
+        // 台标本身已归一化成 2:1，按 2:1 给框才能完整不变形地放下。
+        int logoH = UiScale.pxH(38);
         int logoW = logoH * 2;
-        int logoPad = UiScale.pxH(8);
-        View logoBox = findViewById(R.id.infoLogoBox);
-        ViewGroup.LayoutParams boxLp = logoBox.getLayoutParams();
-        boxLp.width = logoW + logoPad * 2;
-        boxLp.height = logoH + logoPad * 2;
-        logoBox.setLayoutParams(boxLp);
         ViewGroup.LayoutParams logoLp = infoLogo.getLayoutParams();
         logoLp.width = logoW;
         logoLp.height = logoH;
         infoLogo.setLayoutParams(logoLp);
-        // 底板撑满容器，图标靠 layout_gravity=center 停在内框正中
-        View plateV = findViewById(R.id.infoLogoPlate);
-        ViewGroup.LayoutParams plp = plateV.getLayoutParams();
-        plp.width = ViewGroup.LayoutParams.MATCH_PARENT;
-        plp.height = ViewGroup.LayoutParams.MATCH_PARENT;
-        plateV.setLayoutParams(plp);
+        UiScale.margin(infoLogo, 0, 0, 14, 0);
 
-        infoName.setMaxWidth(UiScale.pctW(26));
-        UiScale.text(infoName, 36);
-        TextView infoGroup = infoGroupView();
-        if (infoGroup != null) {
-            UiScale.text(infoGroup, 19);
-            UiScale.margin(infoGroup, 0, 3, 0, 0);
-        }
-        View nameBlock = findViewById(R.id.infoName);
-        if (nameBlock != null && nameBlock.getParent() instanceof View) {
-            UiScale.margin((View) nameBlock.getParent(), 22, 0, 0, 0);
-        }
-        View divider = findViewById(R.id.infoDivider);
-        if (divider != null) {
-            UiScale.margin(divider, 26, 8, 24, 8);
+        // 右侧清晰度面板：宽度按规则 4 收窄到 RIGHT_PANEL_PCT，
+        // 高度铺满整屏（用户要求：面板背景上下对齐屏幕上下）。
+        // 面板本身 match_parent，里面的档位靠 LinearLayout 的
+        // gravity=center_vertical 垂直居中——背景撑满、内容居中，
+        // 而不是让背景跟着内容高度走。
+        ViewGroup.LayoutParams qlp = qualityPanel.getLayoutParams();
+        qlp.width = UiScale.pctW(RIGHT_PANEL_PCT);
+        qlp.height = ViewGroup.LayoutParams.MATCH_PARENT;
+        qualityPanel.setLayoutParams(qlp);
+        // 背景铺到屏幕右缘（paddingEnd 只让内容离边，不影响背景），
+        // 内容右对齐贴着"右实左虚"渐变的不透明一侧
+        UiScale.padding(qualityPanel, 24, 26, 14, 26);
+        qualityPanel.setGravity(android.view.Gravity.END | android.view.Gravity.CENTER_VERTICAL);
+        TextView qLabel = findViewById(R.id.qualityLabel);
+        if (qLabel != null) {
+            UiScale.text(qLabel, 13);
+            UiScale.margin(qLabel, 0, 0, 4, 10);
         }
 
         // 列表上下渐隐的高度随屏幕缩放，避免大屏上显得过窄
@@ -1143,60 +1182,31 @@ public class MainActivity extends Activity {
             }
         }
 
-        // 预览卡：字号和台标尺寸都按屏幕高度走，大屏上不会缩成一小块
-        UiScale.padding(previewCard, 26, 22, 34, 22);
-        ViewGroup.LayoutParams plp2 = previewLogo.getLayoutParams();
-        int pLogoH = UiScale.pxH(60);
-        plp2.width = pLogoH * 2;
-        plp2.height = pLogoH;
-        previewLogo.setLayoutParams(plp2);
-        UiScale.margin(previewLogo, 0, 0, 22, 0);
-        UiScale.text(previewName, 30);
-        UiScale.text(previewMeta, 18);
-        ViewGroup.MarginLayoutParams cardLp =
-                (ViewGroup.MarginLayoutParams) previewCard.getLayoutParams();
-        cardLp.rightMargin = UiScale.pxW(56);
-        cardLp.bottomMargin = UiScale.pxH(56);
-        previewCard.setLayoutParams(cardLp);
+        // 预览台标那套已删除：屏幕上只保留左上角一个正在播的台标。
     }
 
-    /** infoGroup 是可选视图，取不到时不影响其他适配。 */
-    private TextView infoGroupView() {
-        View v = findViewById(R.id.infoGroup);
-        return v instanceof TextView ? (TextView) v : null;
-    }
-
-    /* ---------------- 抽屉内焦点预览 ---------------- */
+    /* ---------------- 抽屉内焦点居中 ---------------- */
 
     /**
-     * 焦点在频道列表上移动时，实时预览目标频道。
+     * 焦点在频道列表上被系统搬走时，把那一行重新滚到垂直正中。
      *
-     * <p>用户用遥控器在列表里上下走，往往要看清"这一行是哪个台"才敢按确定。
-     * 光靠行内文字不够直观，所以在画面右下浮一张卡，显示台标 + 名称 + 分组。
-     * 焦点离开列表就收起，真正切台后也收起，不干扰观看。
+     * <p>主动按上下键走 {@link #moveChannelFocusTo(int)}，那里自带平滑滚动；
+     * 这里只兜住"焦点不是我搬的"那种情况（比如落焦时的自动定位），
+     * 两边都滚会互相打架，所以用 {@code smoothScrollPending} 让位。
+     *
+     * <p>原来这个方法还兼管右下角的"焦点预览台标"。那套已删除——
+     * 用户反馈右下角同时出现两个 logo，分不清哪个是正在播的。
      */
-    private void setupFocusPreview() {
-        list.addOnChildAttachStateChangeListener(
-                new RecyclerView.OnChildAttachStateChangeListener() {
-                    @Override
-                    public void onChildViewAttachedToWindow(@NonNull View view) {
-                        // 新行滚进可视区时，如果它正好拿到焦点就补一次预览
-                        if (view.hasFocus()) {
-                            previewFor(view);
-                        }
-                    }
-
-                    @Override
-                    public void onChildViewDetachedFromWindow(@NonNull View view) {
-                    }
-                });
+    private void setupFocusCentering() {
         // 用焦点变化广播而不是给每行设监听：行是复用的，逐行挂容易漏
         list.setDescendantFocusability(ViewGroup.FOCUS_AFTER_DESCENDANTS);
         list.getViewTreeObserver().addOnGlobalFocusChangeListener((oldFocus, newFocus) -> {
-            if (newFocus != null && isInside(newFocus, list)) {
-                previewFor(newFocus);
-            } else {
-                hidePreviewCard();
+            if (newFocus != null && isInside(newFocus, list)
+                    && listManager != null && !smoothScrollPending) {
+                int pos = listManager.focusedPosition(newFocus);
+                if (pos >= 0) {
+                    listManager.smoothCenterOn(pos);
+                }
             }
         });
     }
@@ -1214,85 +1224,6 @@ public class MainActivity extends Activity {
             f = (View) f.getParent();
         }
         return false;
-    }
-
-    /**
-     * 找到 {@code v} 自己或祖先里直接挂在 {@code parent} 下的那一层。
-     *
-     * <p>{@link RecyclerView#getChildAdapterPosition(View)} 只接受直接子项，
-     * 传子孙进去会抛 {@code ClassCastException}（LayoutParams 类型不符），
-     * 而且是在焦点变化的路径上，直接崩进程。焦点可能落在行内的子 View 上，
-     * 所以必须先归一化。
-     *
-     * @return 直接子项；{@code v} 不在 {@code parent} 里时返回 null
-     */
-    @Nullable
-    private static View directChildOf(@Nullable View v, View parent) {
-        View f = v;
-        while (f != null) {
-            Object p = f.getParent();
-            if (p == parent) {
-                return f;
-            }
-            if (!(p instanceof View)) {
-                return null;
-            }
-            f = (View) p;
-        }
-        return null;
-    }
-
-    /** 按聚焦的行渲染预览卡。 */
-    private void previewFor(View row) {
-        // 焦点可能落在行内部的某个子 View 上（列表是 FOCUS_AFTER_DESCENDANTS），
-        // 而 getChildAdapterPosition 只接受 RecyclerView 的直接子项，
-        // 传子孙 View 进去会因为 LayoutParams 类型不符抛 ClassCastException 直接崩进程。
-        // 所以先往上找到真正挂在列表上的那一层。
-        View item = directChildOf(row, list);
-        if (item == null) {
-            hidePreviewCard();
-            return;
-        }
-        int pos = list.getChildAdapterPosition(item);
-        if (pos < 0 || pos >= channels.size()) {
-            hidePreviewCard();
-            return;
-        }
-        Channel c = channels.get(pos);
-        renderPreviewCard(c);
-    }
-
-    private void renderPreviewCard(Channel c) {
-        // 正在播放的台不用预览——用户已经在看了，浮一张卡只是噪音
-        if (c.name.equals(playingName) && drawer.getVisibility() == View.VISIBLE) {
-            hidePreviewCard();
-            return;
-        }
-        previewName.setText(c.name);
-        String group = ChannelGroups.displayName(c.group);
-        // 顺手告诉用户这个台有几条线路，换台前心里有数
-        int n = c.sources.size();
-        previewMeta.setText(group + (n > 1 ? " · " + n + " 条线路" : ""));
-        android.graphics.Bitmap bmp = ChannelAdapter.LogoCache.get(this, c.logoKey());
-        if (bmp != null) {
-            previewLogo.setImageBitmap(bmp);
-            previewLogo.setVisibility(View.VISIBLE);
-        } else {
-            previewLogo.setImageDrawable(null);
-            previewLogo.setVisibility(View.GONE);
-        }
-        if (previewCard.getVisibility() != View.VISIBLE) {
-            previewCard.setVisibility(View.VISIBLE);
-            previewCard.setAlpha(0f);
-            previewCard.animate().alpha(1f).setDuration(120).start();
-        }
-    }
-
-    private void hidePreviewCard() {
-        if (previewCard.getVisibility() == View.VISIBLE) {
-            previewCard.animate().cancel();
-            previewCard.setVisibility(View.GONE);
-        }
     }
 
     /* ---------------- 数据装载与分组 ---------------- */
@@ -1359,17 +1290,32 @@ public class MainActivity extends Activity {
             return;
         }
         applyGroup(position);
-        // 遥控器把焦点顺到频道列表，省一次按键
-        if (!isTouchMode() && !channels.isEmpty()) {
-            list.requestFocus();
-            ui.postDelayed(() -> {
-                View target = list.getLayoutManager() == null ? null
-                        : list.getLayoutManager().findViewByPosition(Math.max(0, current));
-                if (target != null) {
-                    target.requestFocus();
-                }
-            }, 60);
+        // 选完分组把焦点顺到频道列表，省一次按键。
+        //
+        // 这里**不能**判 isTouchMode()：用户点虚拟遥控器（或任何点击）之后
+        // 窗口就在 touch mode 里，此时 requestFocus() 会被静默拒绝，
+        // 焦点留在分组行上 —— 再按 OK 只会重复选中分组，进不了频道列表。
+        // requestFocusRobust() 会在失败时回退 requestFocusFromTouch()。
+        if (channels.isEmpty()) {
+            return;
         }
+        ui.post(() -> {
+            View row = current >= 0 && listManager != null
+                    ? listManager.findViewByPosition(current) : null;
+            if (row == null) {
+                listManager.centerOn(Math.max(0, current));
+                ui.postDelayed(() -> {
+                    View again = listManager.findViewByPosition(Math.max(0, current));
+                    if (again != null) {
+                        requestFocusRobust(again);
+                    } else {
+                        requestFocusRobust(list);
+                    }
+                }, 50);
+                return;
+            }
+            requestFocusRobust(row);
+        });
     }
 
     /** 切换分组：只换列表内容，不打断正在播放的画面。 */
@@ -1382,8 +1328,22 @@ public class MainActivity extends Activity {
             channels.addAll(src);
         }
         adapter.notifyDataSetChanged();
-        current = indexOfName(playingName);
-        adapter.setCurrent(current);
+        // 列表选中行：正在播的台在本分组里就落在它那一行，否则落在第一行。
+        //
+        // 注意"列表选中行"和"正在播放"是两件事：
+        // 正在播的台不在本分组时，这里仍要选一行（否则方向键没有落点），
+        // 但那一行**绝不能**被标成"正在播放"——是否正在播只看名字
+        // （{@link ChannelAdapter#setPlaying(String)}）。
+        int found = indexOfName(playingName);
+        current = channels.isEmpty() ? -1 : Math.max(0, found);
+        lastFocusPos = current;
+        // 高亮标记按名字刷新：不在本分组时一条都不标
+        adapter.setPlaying(playingName);
+        if (listManager != null) {
+            // 切分组是"整屏内容换掉"：上一个分组留下的滚动过渡没意义，
+            // 而且残留的 translationY 会让新列表整体偏半行
+            listManager.cancelScrollAnim();
+        }
         if (current >= 0) {
             scrollCurrentIntoComfort(current);
         }
@@ -1448,6 +1408,24 @@ public class MainActivity extends Activity {
         }
         return -1;
     }
+
+    /**
+     * 正在播放的频道对象，<b>与"列表当前选中哪一行"无关</b>。
+     *
+     * <p>这是播放相关逻辑取频道的唯一正确方式。原来的写法是
+     * {@code channels.get(current)}，而 {@code current} 是列表焦点行：
+     * 用户切到别的分组浏览时它就指向另一个台（甚至因为夹到 0 而指向第一台），
+     * 于是降档、换源、重开流全都作用到<b>没在播的那个台</b>上。
+     *
+     * <p>返回 {@link #playingRef}（播放器真正在用的那个实例），
+     * 而不是按名字去 master 里重新找——刷新后那是新对象，{@code sourceIndex}
+     * 会指到另一条线路上。返回 null 表示"确实没有正在播的频道"。
+     */
+    @Nullable
+    private Channel playingChannel() {
+        return playingRef;
+    }
+
     /* ---------------- 触摸手势 ---------------- */
 
     /**
@@ -1463,10 +1441,11 @@ public class MainActivity extends Activity {
 
             @Override
             public boolean onSingleTapUp(MotionEvent e) {
-                if (drawer.getVisibility() == View.VISIBLE) {
-                    closeDrawer();
+                // 触摸屏点一下等同 OK 键：开/关整个菜单
+                if (isMenuOpen()) {
+                    closeMenu();
                 } else {
-                    openDrawer();
+                    openMenu();
                 }
                 return true;
             }
@@ -1479,14 +1458,21 @@ public class MainActivity extends Activity {
                 float dx = e2.getX() - e1.getX();
                 float dy = e2.getY() - e1.getY();
                 if (Math.abs(dy) > Math.abs(dx) && Math.abs(dy) > 60) {
+                    // 菜单打开时上下滑不换台（与规则 2 一致：只有菜单没出现才换台）
+                    if (isMenuOpen()) {
+                        return false;
+                    }
                     // 上滑下一个频道，下滑上一个
-                    stepChannel(dy < 0 ? current + 1 : current - 1);
+                    stepFromPlaying(dy < 0 ? 1 : -1);
                     return true;
                 }
                 if (Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > 80) {
-                    if (drawer.getVisibility() == View.VISIBLE && dx < 0) {
-                        closeDrawer();
+                    if (isMenuOpen() && dx < 0) {
+                        closeMenu();
                         return true;
+                    }
+                    if (isMenuOpen()) {
+                        return false;
                     }
                     toggleAspect();
                     return true;
@@ -1497,11 +1483,8 @@ public class MainActivity extends Activity {
 
         View layer = findViewById(R.id.gestureLayer);
         layer.setOnTouchListener((v, event) -> {
-            if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+            if (event.getActionMasked() == MotionEvent.ACTION_DOWN && !isMenuOpen()) {
                 showBar();
-                if (drawer.getVisibility() != View.VISIBLE) {
-                    showInfoBar();
-                }
             }
             return gestures.onTouchEvent(event);
         });
@@ -1546,6 +1529,9 @@ public class MainActivity extends Activity {
         }
         current = index;
         playingName = c.name;
+        // 记下播放器真正在用的实例：后续看门狗/降档/换源都操作它，
+        // 而不是按名字去列表里重新找（刷新后那是另一个对象）
+        playingRef = c;
         hasPlayed = false;
         rebufferStart = 0;
         // 换台后分片序号重新开始，旧计数不能带过来
@@ -1572,8 +1558,9 @@ public class MainActivity extends Activity {
         // 名字和图标立刻显示，不让用户对着黑屏等探测
         nowName.setText(c.name);
         nowMeta.setText(ChannelGroups.displayName(c.group));
-        renderInfoBar(c);
-        adapter.setCurrent(index);
+        renderTopLogo(c);
+        // "正在播放"按名字刷新：列表里只有这个台会带上标记
+        adapter.setPlaying(playingName);
         // 只有抽屉打开时才需要跟着滚动，否则会把隐藏列表滚到用户看不到的位置
         if (drawer.getVisibility() == View.VISIBLE) {
             scrollCurrentIntoComfort(index);
@@ -1702,17 +1689,18 @@ public class MainActivity extends Activity {
         final String playingUrl = c.url(playing);
         final boolean struggling = !hasPlayed;
         SourceProber.pickBetter(this, c, playing, struggling, better -> {
-            if (token != playToken || current < 0 || current >= channels.size()) {
+            // 期间换台了就丢弃：按频道名比，不按列表下标
+            if (token != playToken || !c.name.equals(playingName)) {
                 return;
             }
             if (better < 0 || better == playing) {
                 return;
             }
             // 正在播放的线路已经换了就不要用这份结果覆盖
-            if (!playingUrl.equals(channels.get(current).url(sourceIndex))) {
+            if (!playingUrl.equals(c.url(sourceIndex))) {
                 return;
             }
-            Channel ch = channels.get(current);
+            Channel ch = c;
             int fromRank = ch.source(sourceIndex).effectiveRank();
             int toRank = ch.source(better).effectiveRank();
             // 用户刚手动点过清晰度：这段时间内不做任何静默换线。
@@ -1744,7 +1732,7 @@ public class MainActivity extends Activity {
             }
             android.util.Log.i("IPTVPLAY", "refine " + playing + " -> " + better + " " + c.name);
             sourceIndex = better;
-            renderInfoBar(c);
+            renderTopLogo(c);
             startPlayback(c);
         });
     }
@@ -1766,7 +1754,7 @@ public class MainActivity extends Activity {
     private void startPlayback(Channel c) {
         if (player == null) {
             loading.setVisibility(View.GONE);
-            renderInfoBar(c);
+            renderTopLogo(c);
             return;
         }
         // 换了一条新流：清掉视频渲染器的显示时间基准，
@@ -1791,18 +1779,22 @@ public class MainActivity extends Activity {
         player.setMediaItem(PlaybackTuning.liveItem(c.url(sourceIndex)));
         player.prepare();
         player.setPlayWhenReady(true);
-        renderInfoBar(c);
+        renderTopLogo(c);
         // 每次起播都重新计时：超时还没出画面就说明这条线路喂不饱
         armStartupWatchdog();
     }
 
-    /** 底部信息条：logo + 频道名 + 分辨率胶囊，点胶囊即换到该清晰度的线路。 */
-    private void renderInfoBar(Channel c) {
-        infoName.setText(c.name);
-        TextView infoGroup = infoGroupView();
-        if (infoGroup != null) {
-            infoGroup.setText(ChannelGroups.displayName(c.group));
-        }
+    /**
+     * 左上角台标：只画一张 logo，紧跟台名左边。
+     *
+     * <p>用户要求把 logo 移到左上角和频道文字放在一起。原来右下角
+     * 有<b>两</b>个 logo（焦点预览 + 正在播放），各有一套淡入淡出，
+     * 屏幕上同时出现两个台标，分不清哪个是正在播。现在全屏只有这一个。
+     *
+     * <p>可见性完全跟随顶栏：顶栏由 {@link #showBar()} / {@code hideBar}
+     * 统一计时收起，这里不再单独维护一套"台标淡出"的逻辑。
+     */
+    private void renderTopLogo(Channel c) {
         android.graphics.Bitmap bmp = ChannelAdapter.LogoCache.get(this, c.logoKey());
         if (bmp != null) {
             infoLogo.setImageBitmap(bmp);
@@ -1811,11 +1803,27 @@ public class MainActivity extends Activity {
             infoLogo.setImageDrawable(null);
             infoLogo.setVisibility(View.GONE);
         }
+        renderQualityPanel(c);
+    }
 
-        infoQualityRow.removeAllViews();
+    /**
+     * 右侧清晰度面板：每档一行，选中态高亮，点即切到该档的线路。
+     *
+     * <p>去重规则和原来的胶囊一致：已知分辨率按 {@code displayKey()} 去重，
+     * 还没测出分辨率的线路折叠成一行"更多线路"，避免十条未知源把面板撑爆。
+     */
+    private void renderQualityPanel(Channel c) {
+        if (qualityRow == null) {
+            return;
+        }
+        // 先记住"重建前焦点在不在面板里"。removeAllViews() 会把焦点连带清掉，
+        // 之后再问 inQualityPanel() 一定返回 false —— 那样用户在面板里选完一档，
+        // 焦点就会掉回左侧分组栏，还得再按一次右键才能继续选。
+        final boolean keepFocus = qualityPanel.getVisibility() == View.VISIBLE
+                && inQualityPanel();
+        qualityRow.removeAllViews();
         String currentLabel = c.source(sourceIndex).displayKey();
 
-        // 已知分辨率去重后逐个列出；还没测出分辨率的线路折叠成一个"更多线路"
         Set<String> used = new LinkedHashSet<>();
         int firstUnknown = -1;
         int unknownCount = 0;
@@ -1832,17 +1840,27 @@ public class MainActivity extends Activity {
             if (!used.add(key)) {
                 continue;
             }
-            addQualityPill(key, i, key.equals(currentLabel));
+            addQualityRowItem(key, i, key.equals(currentLabel));
         }
         boolean onUnknown = c.source(sourceIndex).displayKey().isEmpty();
         if (firstUnknown >= 0) {
-            // 未知线路没有区分信息，横排一行只会变成噪音
             int target = onUnknown ? nextUnknown(c, sourceIndex) : firstUnknown;
-            addQualityPill("更多线路" + (unknownCount > 1 ? " " + unknownCount : ""),
+            addQualityRowItem("更多线路" + (unknownCount > 1 ? " " + unknownCount : ""),
                     target, onUnknown);
         }
-        // 信息条常驻会挡住画面，渲染完就重新计时，5 秒后自动下滑
-        showInfoBar();
+        // 面板开着时重建了视图（用户刚选了另一档），焦点会随旧视图一起没掉，
+        // 不补回来的话上面板立刻"失灵"，还得再按一次右键。
+        // 但焦点本来就不在面板里时（OK 键同开抽屉、用户在选台）不要抢：
+        // 那种情况下重建只是刷新选中态，抢焦点会把用户从频道列表踹出来。
+        if (keepFocus) {
+            final View focus = currentQualityItem();
+            ui.post(() -> {
+                if (qualityPanel.getVisibility() == View.VISIBLE && focus != null) {
+                    focus.requestFocus();
+                    scrollQualityIntoView(focus);
+                }
+            });
+        }
     }
 
     /** 找下一个清晰度未知的线路，用来在"更多线路"上循环。 */
@@ -1856,26 +1874,38 @@ public class MainActivity extends Activity {
         return from;
     }
 
-    /** 信息条上的一个分辨率胶囊，尺寸随屏幕高度缩放。 */
-    private void addQualityPill(String text, int index, boolean active) {
-        TextView pill = new TextView(this);
-        pill.setText(text);
-        UiScale.text(pill, 30);
-        pill.setTextColor(0xFFFFFFFF);
-        pill.setTypeface(pill.getTypeface(), android.graphics.Typeface.BOLD);
-        pill.setGravity(android.view.Gravity.CENTER);
-        pill.setBackgroundResource(R.drawable.quality_pill);
-        int px = UiScale.pxW(30);
-        int py = UiScale.pxH(13);
-        pill.setPadding(px, py, px, py);
-        pill.setSelected(active);
-        pill.setClickable(true);
-        pill.setFocusable(true);
-        pill.setOnClickListener(v -> switchQuality(index));
+    /**
+     * 清晰度面板上的一行：一个档位。
+     *
+     * <p>样式与左侧抽屉的分组项完全同构（{@code group_bg} / {@code group_text}）：
+     * 10dp 圆角、焦点实心蓝、选中淡蓝 + 描边、未选中全透明。
+     * 早先用的是 999dp 胶囊 + 半透明白底，跟左边一比就像两个 App 拼起来的。
+     *
+     * <p>行宽铺满面板而不是包住文字：左侧频道行也是整行高亮，
+     * 竖排时整行才看得出"这是一行选项"；胶囊宽度不一反而参差。
+     */
+    private void addQualityRowItem(String text, int index, boolean active) {
+        TextView item = new TextView(this);
+        item.setText(text);
+        // 规则 4 把面板收窄到 16% 后字号要跟着收一档，
+        // 否则 `1080P` 五个字符会把整行撑满、没有呼吸空间
+        UiScale.text(item, 22);
+        item.setTextColor(getResources().getColorStateList(R.color.quality_text));
+        item.setTypeface(item.getTypeface(), android.graphics.Typeface.BOLD);
+        item.setGravity(android.view.Gravity.CENTER);
+        item.setBackgroundResource(R.drawable.quality_row_bg);
+        UiScale.padding(item, 8, 12, 8, 12);
+        item.setSelected(active);
+        item.setClickable(true);
+        item.setFocusable(true);
+        // 同 item_channel.xml：触摸模式下 requestFocus 会被拒绝，
+        // 加了这个标记才能点完虚拟遥控器后用方向键继续选档位
+        item.setFocusableInTouchMode(true);
+        item.setOnClickListener(v -> switchQuality(index));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        lp.rightMargin = UiScale.pxW(16);
-        infoQualityRow.addView(pill, lp);
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.bottomMargin = UiScale.pxH(8);
+        qualityRow.addView(item, lp);
     }
 
     /**
@@ -1888,11 +1918,11 @@ public class MainActivity extends Activity {
      */
     private void rememberRealQuality(int height) {
         String label = QualityMemory.labelOf(height);
-        if (label == null || current < 0 || current >= channels.size()) {
+        if (label == null) {
             return;
         }
-        Channel c = channels.get(current);
-        if (c.sources.isEmpty()) {
+        Channel c = playingChannel();
+        if (c == null || c.sources.isEmpty()) {
             return;
         }
         Channel.Source s = c.source(sourceIndex);
@@ -1906,20 +1936,190 @@ public class MainActivity extends Activity {
             android.util.Log.i("IPTVQUAL", "measured ch=" + c.name
                     + " tag=" + s.quality + " real=" + label + " url=" + s.url);
         }
-        renderInfoBar(c);
+        renderTopLogo(c);
     }
 
-    /** 焦点从分辨率胶囊收回播放画面，遥控器换台才能继续生效。 */
-    private void hideQualitySheet() {
-        findViewById(R.id.root).requestFocus();
+    /* ---------------- 右侧清晰度面板 ---------------- */
+
+    /** 菜单是否打开（抽屉或清晰度面板任一可见即算，两者本应同进同退）。 */
+    private boolean isMenuOpen() {
+        return drawer.getVisibility() == View.VISIBLE
+                || qualityPanel.getVisibility() == View.VISIBLE;
+    }
+
+    /**
+     * 把焦点送进清晰度面板的当前档位，带一帧延迟重试。
+     *
+     * <p>规则 3：右键 / 左菜单能跳到右侧档位，所以这是个独立的焦点搬运动作，
+     * 不再伴随"打开面板"——面板此时已经是可见的。
+     */
+    private void focusQualityPanel() {
+        // 目标必须是"已 selected 的那一档"（当前正在播的清晰度），
+        // 而不是按下标猜。面板是按 displayKey() 去重后的视图，与 sourceIndex 不同构。
+        ui.post(() -> {
+            if (qualityPanel.getVisibility() != View.VISIBLE) {
+                return;
+            }
+            attemptQualityFocus(0);
+        });
+    }
+
+    /**
+     * 把焦点落到当前档位，带重试。
+     *
+     * <p>面板刚 setVisibility(VISIBLE) 时行还没布局，{@code requestFocus()}
+     * 会静默失败；早先只补一次 40ms 重试，实测仍会落到上一档停留处
+     * （按 UP 只前进一步就卡住）。这里改成逐帧重试，
+     * 直到焦点真的落在 qualityRow 的子项上为止。
+     */
+    private void attemptQualityFocus(int attempt) {
+        if (qualityPanel.getVisibility() != View.VISIBLE) {
+            return;
+        }
+        View target = currentQualityItem();
+        if (target != null && requestFocusRobust(target)) {
+            View now = getCurrentFocus();
+            if (indexContaining(qualityRow, now) >= 0) {
+                scrollQualityIntoView(now);
+                return;
+            }
+        }
+        if (attempt < 6) {
+            ui.postDelayed(() -> attemptQualityFocus(attempt + 1), 40);
+        } else {
+            android.util.Log.w("IPTVFOCUS", "quality focus give-up attempt=" + attempt);
+        }
+    }
+
+    /**
+     * 在右侧清晰度面板内上下移动焦点。
+     *
+     * <p><b>为什么不用焦点导航自己走。</b>系统只按几何位置找下一个控件，
+     * 从最上面一档再按「上」会横向窜到左侧频道行（实测落到
+     * {@code id/metaScroll}），面板里就再也按不回来了。菜单内"上下选档"
+     * 必须是一个自洽闭环：到顶就停在顶上，到底就停在底下。
+     *
+     * <p>上下到达边界时返回 {@code true} 吞掉按键，而不是交给系统——
+     * 否则同样会触发那次窜行。
+     *
+     * @return 恒为 true（面板内的上下键一律由这里接管）
+     */
+    private boolean stepQualityFocus(int delta) {
+        if (qualityRow == null || qualityRow.getChildCount() == 0) {
+            return true;
+        }
+        int count = qualityRow.getChildCount();
+        int from = indexContaining(qualityRow, getCurrentFocus());
+        if (from < 0) {
+            from = 0;
+        }
+        int to = Math.max(0, Math.min(count - 1, from + delta));
+        if (to != from) {
+            View item = qualityRow.getChildAt(to);
+            requestFocusRobust(item);
+            scrollQualityIntoView(item);
+        }
+        return true;
+    }
+
+    /**
+     * {@code focused} 落在 {@code parent} 的第几个直接子项里；不在里面返回 -1。
+     *
+     * <p><b>不能用 {@code parent.getChildAt(i) == focused} 直接比。</b>
+     * 档位项/频道行内部还有 TextView，焦点实际停在那个子 View 上，
+     * 精确比较永远不成立，{@code from} 于是恒为 0——
+     * 表现为「在面板里按 UP 到某一档就再也上不去」（实测 720P 卡住）。
+     */
+    private static int indexContaining(ViewGroup parent, View focused) {
+        if (parent == null || focused == null) {
+            return -1;
+        }
+        View f = focused;
+        while (f != null) {
+            if (f.getParent() == parent) {
+                for (int i = 0; i < parent.getChildCount(); i++) {
+                    if (parent.getChildAt(i) == f) {
+                        return i;
+                    }
+                }
+                return -1;
+            }
+            Object p = f.getParent();
+            f = p instanceof View ? (View) p : null;
+        }
+        return -1;
+    }
+
+    /** 面板里表示"当前正在播这一档"的那一行；没有就返回第一行。 */
+    private View currentQualityItem() {
+        if (qualityRow == null || qualityRow.getChildCount() == 0) {
+            return null;
+        }
+        for (int i = 0; i < qualityRow.getChildCount(); i++) {
+            View v = qualityRow.getChildAt(i);
+            if (v.isSelected()) {
+                return v;
+            }
+        }
+        return qualityRow.getChildAt(0);
+    }
+
+    /** 当前焦点的那一行滚进可视区，防止档位多时选中项在屏幕外。 */
+    private void scrollQualityIntoView(View item) {
+        if (item == null || qualityScroll == null || qualityRow == null) {
+            return;
+        }
+        int top = item.getTop();
+        int bottom = item.getBottom();
+        int viewH = qualityScroll.getHeight();
+        int cur = qualityScroll.getScrollY();
+        if (top < cur || bottom > cur + viewH) {
+            qualityScroll.smoothScrollTo(0, Math.max(0, top - viewH / 3));
+        }
+    }
+
+    /**
+     * 档位太多时把面板限高，超出的部分滚动。
+     *
+     * <p>CCTV-1 这类有十几个备胎的频道，如果按内容高度铺开，
+     * 面板会被撑出屏幕、标题被顶飞。这里量一次内容高度，
+     * 超过屏幕 72% 就锁在上限，让 ScrollView 自己滚；
+     * 内容本来就矮（只有两档）时保持 wrap_content，
+     * 面板才会紧贴内容居中，而不是上下留一大片空白。
+     */
+    private void adaptQualityScrollHeight() {
+        if (qualityScroll == null || qualityRow == null) {
+            return;
+        }
+        final int maxH = UiScale.pctH(72);
+        final ViewGroup.LayoutParams lp = qualityScroll.getLayoutParams();
+        qualityRow.post(() -> {
+            // 量"所有子行的高度之和"，而不是 qualityRow.getHeight()：
+            // 上一次把 ScrollView 限高后，子行会被裁剪，
+            // getHeight() 拿到的是被压过的值，档位变少时就会卡在旧高度上。
+            int contentH = 0;
+            for (int i = 0; i < qualityRow.getChildCount(); i++) {
+                View child = qualityRow.getChildAt(i);
+                contentH += child.getHeight();
+                if (child.getLayoutParams() instanceof ViewGroup.MarginLayoutParams) {
+                    contentH += ((ViewGroup.MarginLayoutParams)
+                            child.getLayoutParams()).bottomMargin;
+                }
+            }
+            int want = Math.min(contentH, maxH);
+            if (want > 0 && lp.height != want) {
+                lp.height = want;
+                qualityScroll.setLayoutParams(lp);
+            }
+        });
     }
 
     /** 切换清晰度：用户明确点了某一路，就照播那一路，不再自动挑。 */
     private void switchQuality(int index) {
-        if (current < 0 || current >= channels.size()) {
+        Channel c = playingChannel();
+        if (c == null) {
             return;
         }
-        Channel c = channels.get(current);
         if (index < 0 || index >= c.sources.size()) {
             return;
         }
@@ -1948,7 +2148,7 @@ public class MainActivity extends Activity {
         speed.reset();
         LiveSpeedMeter.INSTANCE.reset();
         // 重新渲染信息条让选中态跟上用户的选择
-        renderInfoBar(c);
+        renderTopLogo(c);
         startPlayback(c);
     }
 
@@ -1971,20 +2171,21 @@ public class MainActivity extends Activity {
     private final Runnable recoverPlayback = new Runnable() {
         @Override
         public void run() {
-            if (player == null || current < 0 || current >= channels.size()) {
+            Channel c = playingChannel();
+            if (player == null || c == null) {
                 return;
             }
             int err = player.getPlayerError() == null ? 0 : player.getPlayerError().errorCode;
             if (err == PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW) {
                 // 窗口滑走只能回到直播边缘，重试同一地址即可
                 retryRound = 0;
-                startPlayback(channels.get(current));
+                startPlayback(c);
                 return;
             }
             // 其余错误多给几轮机会，节目单里的线路时常是短暂抽风
             if (retryRound < MAX_RETRY_ROUNDS) {
                 retryRound++;
-                startPlayback(channels.get(current));
+                startPlayback(c);
                 return;
             }
             // 原地重试都失败了，这条线路确实不可用。交给探测重新挑一条，
@@ -2071,16 +2272,21 @@ public class MainActivity extends Activity {
 
     /** 当前线路彻底失败后重新探测换线，跳过已经失败的那一路。 */
     private void repickSource() {
-        final Channel c = channels.get(current);
+        // 重挑线路永远是给"正在播放的那个台"换，而不是列表焦点行
+        final Channel c = playingChannel();
+        if (c == null) {
+            return;
+        }
         final int failed = sourceIndex;
-        final int index = current;
+        final String chName = c.name;
         // 失败线路不能再当"记忆线路"，否则下次换台还会先踩一次坑
         SourceMemory.remove(this, c.name);
         loading.setVisibility(View.VISIBLE);
         speed.reset();
         LiveSpeedMeter.INSTANCE.reset();
         SourceProber.pickExcluding(this, c, -1, failed, picked -> {
-            if (current != index) {
+            // 期间换台了就丢弃（按名字比，不按下标）
+            if (!chName.equals(playingName)) {
                 return;
             }
             if (picked < 0) {
@@ -2104,7 +2310,8 @@ public class MainActivity extends Activity {
         sourceIndex = 0;
         retryRound = 0;
         play(position);
-        closeDrawer();
+        // 选台后收起整个菜单（规则 1：抽屉和清晰度面板同进同退）
+        closeMenu();
     }
 
     /** 长按频道行：收藏 + 手动选线路。 */
@@ -2159,10 +2366,22 @@ public class MainActivity extends Activity {
                 "信息：上次更新 " + updated,
                 "信息：当前源 " + source,
         };
+        // 调试包才多一项：虚拟遥控器开关。release 包里 available() 恒为 false，
+        // 菜单结构和用户看到的完全一致，不会多出一个灰掉的死条目
+        if (VirtualRemote.available()) {
+            String[] withRemote = java.util.Arrays.copyOf(items, items.length + 1);
+            withRemote[items.length] = VirtualRemote.isOpen()
+                    ? "隐藏虚拟遥控（调试）" : "显示虚拟遥控（调试）";
+            items = withRemote;
+        }
+        final int remoteIndex = VirtualRemote.available() ? items.length - 1 : -1;
         new AlertDialog.Builder(this)
                 .setTitle("设置")
                 .setItems(items, (d, which) -> {
-                    if (which == 0) {
+                    if (which == remoteIndex) {
+                        VirtualRemote.setOpen(!VirtualRemote.isOpen());
+                        showHint(VirtualRemote.isOpen() ? "虚拟遥控已显示" : "虚拟遥控已隐藏");
+                    } else if (which == 0) {
                         manualRefresh();
                     } else if (which == 1) {
                         askSource();
@@ -2175,18 +2394,27 @@ public class MainActivity extends Activity {
                 .show();
     }
 
-    /** 缓存过期就静默更新，成功后用新列表刷新界面。 */
-    private void refreshIfStale() {
-        if (!store.isStale()) {
-            return;
-        }
+    /**
+     * 规则 6：每次打开 App 都在后台刷新频道列表。
+     *
+     * <p>原来只在缓存过期（24 小时）时才拉，意味着用户一天内第二次打开
+     * 完全不刷新，坏掉的线路永远留在列表里。现在<b>每次启动都拉</b>：
+     * 拉取在后台线程，不挡起播；失败就静默保留本地列表。
+     *
+     * <p>刷新后除了换新数据，还会走 {@link ChannelStore#load()}，
+     * 那里会按 {@link DeadSources} 剔除已验证的坏线路。
+     */
+    private void refreshInBackground() {
         final String keep = playingName;
         new Thread(() -> {
             try {
                 final int n = store.refresh();
+                android.util.Log.i("IPTVSTORE", "auto-refresh ok channels=" + n);
                 ui.post(() -> reloadKeeping(keep));
             } catch (Exception e) {
                 // 静默失败：本地列表本来就能用，不该用"更新失败"吓用户
+                android.util.Log.i("IPTVSTORE", "auto-refresh skipped: " + e);
+                ui.post(() -> reloadKeeping(keep));
             }
         }, "iptv-startup-refresh").start();
     }
@@ -2266,17 +2494,30 @@ public class MainActivity extends Activity {
     /* ---------------- 抽屉 ---------------- */
 
     /**
-     * 把当前频道顶到列表首行，上方不留半截行。
-     * 必须等下一次布局完成，否则位置按旧数据算，会滚偏。
+     * 把当前频道行滚到列表垂直正中（规则 5）。
+     *
+     * <p>居中而不是"刚好露出来"，有两个理由：
+     * <ol>
+     *   <li><b>用户要看得到下一个频道。</b>行贴着列表底部时，下面全是空白，
+     *       根本不知道再按一下会切到哪一台。</li>
+     *   <li><b>不居中会卡焦点。</b>默认布局管理器把下一行滚到只露出十几像素
+     *       就收手，那一行既"算可见"又没完整布局，焦点搜索找得到却跳不过去，
+     *       连续按 DOWN 到第 5 行之后就再也动不了（真机、模拟器都能复现）。</li>
+     * </ol>
+     *
+     * <p>滚动的唯一入口是 {@link CenteringLayoutManager#centerOn(int)}；
+     * 系统自己那套"滚到可见"已经在布局管理器里关掉了，避免两套滚动打架。
      */
     private void scrollCurrentIntoComfort(int position) {
+        if (position < 0) {
+            return;
+        }
         list.post(() -> {
-            RecyclerView.LayoutManager m = list.getLayoutManager();
-            if (m instanceof LinearLayoutManager) {
-                ((LinearLayoutManager) m).scrollToPositionWithOffset(position, 0);
-            } else {
+            if (listManager == null) {
                 list.scrollToPosition(position);
+                return;
             }
+            listManager.centerOn(position);
         });
     }
 
@@ -2290,23 +2531,72 @@ public class MainActivity extends Activity {
                 + "\n共 " + master.size() + " 个频道 · " + when);
     }
 
-    private void openDrawer() {
-        hideQualitySheet();
-        hideInfoBarNow();
-        // 抽屉封顶到屏幕顶端，顶栏让位避免文字叠在一起
+    /**
+     * 打开<b>整个菜单</b>：左抽屉 + 右清晰度面板 + 右下角信息条。
+     *
+     * <p>规则 1/3 要求这两块是<b>同一个菜单</b>，同生同灭。所以只能有
+     * 这一个入口——早期拆成 {@code openDrawer()} / {@code openQualityPanel()}
+     * 两个方法，结果出现过"只有右边没有左边"的半套界面，
+     * 用户按上下键时分不清自己到底在选频道还是选清晰度。
+     *
+     * <p>焦点按规则 2 落进<b>频道列表</b>：菜单打开时上下键是"在菜单内选"，
+     * 默认从频道开始，按右键跳到清晰度，按左键跳回来（规则 3）。
+     */
+    private void openMenu() {
+        if (isMenuOpen()) {
+            return;
+        }
+        // 顶栏让位，避免和抽屉头部文字叠在一起
         topBar.setVisibility(View.GONE);
         ui.removeCallbacks(hideBar);
+        if (listManager != null) {
+            // 上次收起菜单时可能有个滚动过渡没跑完，残留的 translationY
+            // 会让重新出现的列表整体偏移半行，像"第一行被裁掉一截"
+            listManager.cancelScrollAnim();
+        }
         drawer.setVisibility(View.VISIBLE);
-        adapter.setCurrent(current);
+        // "正在播放"标记按频道名刷新，和列表选中行无关
+        adapter.setPlaying(playingName);
         groupAdapter.setCurrent(currentGroup);
+        qualityPanel.setVisibility(View.VISIBLE);
+        adaptQualityScrollHeight();
+        // 面板贴右缘，调试用的虚拟遥控器默认也在右下角，会压住档位。
+        // 告诉它让出面板占的宽度，它自己横移到左边那段空隙里
+        VirtualRemote.setReservedRight(UiScale.pctW(RIGHT_PANEL_PCT));
+
+        // 规则 5：先把当前频道行滚进视口，再落焦；
+        // 顺序反了会被焦点系统的自动滚动覆盖掉，当前行可能被裁在视口外
         if (current >= 0) {
             scrollCurrentIntoComfort(current);
         }
-        final boolean touch = isTouchMode();
-        // 遥控器把焦点落到当前频道；触摸屏不抢焦点，避免出现无用的高亮
-        if (!touch) {
-            focusDrawerList(0);
+        // 规则 3 的前提是"菜单里有焦点"，所以这里**必须**落焦，不能因为
+        // isTouchMode() 就跳过。
+        //
+        // 之前写成 `if (!isTouchMode()) focusDrawerList(0)`，本意是不给触摸屏
+        // 留无用的高亮，结果点屏（虚拟遥控器也是点屏）后窗口一直在 touch mode，
+        // 菜单打开了却没有任何 View 持有焦点 —— 上下左右键全部失效，
+        // 用户看到的就是"按 OK 后方向键压根没法切换"。
+        // 触摸模式下仍需落焦，只是改用 requestFocusFromTouch() 绕开限制。
+        focusDrawerList(0);
+    }
+
+    /** 收起整个菜单：三块一起走，不留半套 UI（规则 1）。 */
+    private void closeMenu() {
+        if (!isMenuOpen()) {
+            // 菜单本来就关着：仍要把调试遥控器的让位复位，
+            // 否则它停在"左移让开清晰度面板"的位置，菜单一关就悬在画面中间
+            VirtualRemote.setReservedRight(0);
+            return;
         }
+        drawer.setVisibility(View.GONE);
+        qualityPanel.setVisibility(View.GONE);
+        VirtualRemote.setReservedRight(0);
+        if (listManager != null) {
+            // 收起时若有过渡在跑，立刻停下并把行放回真实位置，
+            // 否则下次打开会带着残留平移量出现
+            listManager.cancelScrollAnim();
+        }
+        findViewById(R.id.root).requestFocus();
         showBar();
     }
 
@@ -2329,10 +2619,9 @@ public class MainActivity extends Activity {
         if (list.getLayoutManager() != null && current >= 0) {
             target = list.getLayoutManager().findViewByPosition(current);
         }
-        boolean ok = target != null && target.requestFocus();
+        boolean ok = target != null && requestFocusRobust(target);
         if (ok) {
-            // 焦点系统会把行再滚一次以留出余量，这里覆盖回去，
-            // 让当前行稳稳对齐列表首行，上方不残留半截行
+            // 布局刚完成时行高可能还没量准，下一帧再居中一次
             ui.postDelayed(() -> {
                 if (current >= 0 && drawer.getVisibility() == View.VISIBLE) {
                     scrollCurrentIntoComfort(current);
@@ -2342,7 +2631,7 @@ public class MainActivity extends Activity {
         }
         if (attempt >= 6) {
             // 真的取不到具体行：落焦列表本身，方向键至少能用
-            boolean listOk = list.requestFocus();
+            boolean listOk = requestFocusRobust(list);
             android.util.Log.w("IPTVFOCUS", "drawer-focus fallback current=" + current
                     + " ok=" + listOk);
             return;
@@ -2351,18 +2640,31 @@ public class MainActivity extends Activity {
         ui.postDelayed(() -> focusDrawerList(attempt + 1), 40);
     }
 
+    /**
+     * 落焦，能穿过 touch mode 的限制。
+     *
+     * <p>窗口一旦进入 touch mode（点过屏幕，包括点虚拟遥控器），普通的
+     * {@link View#requestFocus()} 会被<b>静默拒绝</b>——返回 false，焦点不动。
+     * 界面就成了"菜单打开了，但方向键没有任何反应"。
+     *
+     * <p>{@link View#requestFocusFromTouch()} 是系统给触摸场景留的通道：
+     * 它不仅会落焦，还会主动让窗口退出 touch mode，之后方向键就正常了。
+     * 电视应用的菜单本质上是"遥控器导航"，不该因为用户点过一次屏幕就残废。
+     */
+    private static boolean requestFocusRobust(View v) {
+        if (v == null) {
+            return false;
+        }
+        if (v.requestFocus()) {
+            return true;
+        }
+        return v.requestFocusFromTouch();
+    }
+
     /** 有触摸能力且最近没有按键输入时按触摸屏处理。 */
     private boolean isTouchMode() {
         return getPackageManager().hasSystemFeature(PackageManager.FEATURE_TOUCHSCREEN)
                 && System.currentTimeMillis() - lastKeyAt > 3000;
-    }
-
-    private void closeDrawer() {
-        drawer.setVisibility(View.GONE);
-        hidePreviewCard();
-        findViewById(R.id.root).requestFocus();
-        showInfoBar();
-        showBar();
     }
 
     /** 顶栏在抽屉打开时保持隐藏，避免和抽屉头部重叠。 */
@@ -2387,15 +2689,19 @@ public class MainActivity extends Activity {
         ui.postDelayed(hideHint, 5000);
     }
 
-    /** 提示浮层不参与布局，自己让开信息条：条可见时抬到它上沿之上。 */
+    /**
+     * 提示浮层的竖直位置。
+     *
+     * <p>台标已移到左上角顶栏，不再占右下角，所以这里不需要为它让位，
+     * 固定贴着底边往上抬一点即可。
+     */
     private void placeHint() {
         ViewGroup.LayoutParams lp = hint.getLayoutParams();
         if (!(lp instanceof ViewGroup.MarginLayoutParams)) {
             return;
         }
         ViewGroup.MarginLayoutParams m = (ViewGroup.MarginLayoutParams) lp;
-        int bar = infoBar.getVisibility() == View.VISIBLE ? infoBar.getHeight() : 0;
-        int target = UiScale.pxH(18) + bar;
+        int target = UiScale.pxH(18);
         if (m.bottomMargin != target) {
             m.bottomMargin = target;
             hint.setLayoutParams(m);
@@ -2409,18 +2715,25 @@ public class MainActivity extends Activity {
 
     /* ---------------- 按键 ---------------- */
 
+    /**
+     * 遥控器按键分流。
+     *
+     * <p>规则 1/2/3 的核心是「菜单打开」这一个状态：菜单没出现时上下键换台，
+     * 菜单出现后上下左右键全部用于在菜单内选择。所以这里只有一个
+     * {@code menuOpen} 判据，不再分抽屉/清晰度面板两套。
+     */
     @Override
     public boolean onKeyDown(int keyCode, KeyEvent event) {
-        boolean drawerOpen = drawer.getVisibility() == View.VISIBLE;
+        boolean menuOpen = isMenuOpen();
         lastKeyAt = System.currentTimeMillis();
-        // 任何遥控器操作都重新亮出信息条，静置 5 秒后再自动收起；
-        // BACK 例外，它是要把界面收干净的
-        if (!drawerOpen && keyCode != KeyEvent.KEYCODE_BACK) {
-            showInfoBar();
+        // 菜单关闭时任何按键都亮出顶栏（台标 + 台名），静置后自动收起。
+        // 台标现在就在顶栏里，不再有独立的一套显隐计时。
+        if (!menuOpen && keyCode != KeyEvent.KEYCODE_BACK) {
+            showBar();
         }
 
-        // 数字键直接换台，1.5 秒内连续输入有效
-        if (keyCode >= KeyEvent.KEYCODE_0 && keyCode <= KeyEvent.KEYCODE_9 && !drawerOpen) {
+        // 数字键直接换台，1.5 秒内连续输入有效（菜单打开时不响应）
+        if (keyCode >= KeyEvent.KEYCODE_0 && keyCode <= KeyEvent.KEYCODE_9 && !menuOpen) {
             ui.removeCallbacks(clearNumber);
             ui.postDelayed(clearNumber, NUMBER_WINDOW_MS);
             if (numberBuf.length() >= 3) {
@@ -2429,6 +2742,10 @@ public class MainActivity extends Activity {
             numberBuf.append((char) ('0' + (keyCode - KeyEvent.KEYCODE_0)));
             showHint("跳转到 " + numberBuf);
             int n = Integer.parseInt(numberBuf.toString());
+            // 数字是"正在看的这个分组的第 n 个台"。若用户刚在菜单里浏览过
+            // 别的分组，channels 已经不是正在看的那一组，下标会指到别的台，
+            // 所以先把分组切回正在播的那一组（和 stepFromPlaying 同理）。
+            ensurePlayingGroup();
             if (n >= 1 && n <= channels.size()) {
                 stepChannel(n - 1);
             }
@@ -2439,100 +2756,111 @@ public class MainActivity extends Activity {
             case KeyEvent.KEYCODE_DPAD_CENTER:
             case KeyEvent.KEYCODE_ENTER:
             case KeyEvent.KEYCODE_NUMPAD_ENTER:
-                if (inInfoBar()) {
-                    // 有焦点时交给胶囊自己处理点击
+                if (menuOpen) {
+                    // 规则 1/3：菜单内 OK 交给焦点项（选台 / 选清晰度）
                     return super.onKeyDown(keyCode, event);
                 }
-                if (!drawerOpen) {
-                    // OK 键呼出底部栏（原来的行为是打开左侧抽屉，
-                    // 现在左右键负责抽屉，OK 专管底栏）。
-                    // 必须同时把焦点落进胶囊：上下键已改为换台，
-                    // 若焦点留在画面上就再也选不到清晰度了。
-                    showInfoBar();
-                    focusQualityPill();
-                    return true;
-                }
-                return super.onKeyDown(keyCode, event);
+                // 规则 1：OK 一次叫出左边频道列表 + 右边清晰度面板
+                openMenu();
+                return true;
 
             case KeyEvent.KEYCODE_DPAD_UP:
-                if (inInfoBar()) {
-                    hideQualitySheet();
-                    return true;
+                if (menuOpen) {
+                    // 规则 3：菜单打开时上下键在菜单内移动焦点。
+                    // 焦点在右侧档位 / 左侧频道列表时都自己算下一项，不交给 super：
+                    // 焦点导航只认几何相邻、且"露出一点就算可见"，
+                    // 走到边界会窜到另一个面板（实测落到 id/metaScroll），
+                    // 或者干脆卡住不动（实测连续 DOWN 到第 5 行后 bounds 完全不变）。
+                    if (inQualityPanel()) {
+                        return stepQualityFocus(-1);
+                    }
+                    if (inDrawerList()) {
+                        return stepChannelFocus(-1);
+                    }
+                    if (inGroupList()) {
+                        return stepGroupFocus(-1);
+                    }
+                    return super.onKeyDown(keyCode, event);
                 }
-                if (!drawerOpen) {
-                    stepChannel(current - 1);
-                    return true;
-                }
-                return super.onKeyDown(keyCode, event);
+                // 规则 2：菜单没出现时上下键换台
+                stepFromPlaying(-1);
+                return true;
 
             case KeyEvent.KEYCODE_DPAD_DOWN:
-                if (inInfoBar()) {
-                    hideQualitySheet();
-                    return true;
+                if (menuOpen) {
+                    if (inQualityPanel()) {
+                        return stepQualityFocus(1);
+                    }
+                    if (inDrawerList()) {
+                        return stepChannelFocus(1);
+                    }
+                    if (inGroupList()) {
+                        return stepGroupFocus(1);
+                    }
+                    return super.onKeyDown(keyCode, event);
                 }
-                if (!drawerOpen) {
-                    stepChannel(current + 1);
-                    return true;
-                }
-                return super.onKeyDown(keyCode, event);
+                stepFromPlaying(1);
+                return true;
 
             case KeyEvent.KEYCODE_CHANNEL_UP:
             case KeyEvent.KEYCODE_PAGE_UP:
-                if (!drawerOpen) {
-                    stepChannel(current + 1);
+                if (!menuOpen) {
+                    stepFromPlaying(1);
                     return true;
                 }
                 return super.onKeyDown(keyCode, event);
 
             case KeyEvent.KEYCODE_CHANNEL_DOWN:
             case KeyEvent.KEYCODE_PAGE_DOWN:
-                if (!drawerOpen) {
-                    stepChannel(current - 1);
+                if (!menuOpen) {
+                    stepFromPlaying(-1);
                     return true;
                 }
                 return super.onKeyDown(keyCode, event);
 
             case KeyEvent.KEYCODE_DPAD_LEFT:
-                if (drawerOpen) {
-                    // 抽屉内交给焦点导航：右栏向左可回到分组栏
-                    return super.onKeyDown(keyCode, event);
+                if (!menuOpen) {
+                    // 规则 1：左右键不再单独打开面板
+                    return true;
                 }
-                if (inInfoBar()) {
-                    // 焦点在分辨率胶囊上，交给焦点系统横向移动
-                    return super.onKeyDown(keyCode, event);
+                if (inQualityPanel()) {
+                    // 规则 3：从右侧档位跳回左侧频道列表
+                    focusDrawerList(0);
+                    return true;
                 }
-                // 左键呼出左侧菜单（抽屉）
-                openDrawer();
-                return true;
+                // 焦点已在左侧：交给焦点导航（频道列表 → 分组栏）
+                return super.onKeyDown(keyCode, event);
 
             case KeyEvent.KEYCODE_DPAD_RIGHT:
-                if (drawerOpen || inInfoBar()) {
-                    return super.onKeyDown(keyCode, event);
+                if (!menuOpen) {
+                    // 规则 1：左右键不再单独打开面板，菜单外一律不响应
+                    return true;
                 }
-                // 右键同样呼出左侧菜单：左右对称，用户不必记哪边是"开"
-                openDrawer();
+                if (inQualityPanel()) {
+                    // 已经在最右侧，再按右没有去处
+                    return true;
+                }
+                // 规则 3：从左侧跳到右侧清晰度档位
+                focusQualityPanel();
                 return true;
 
             case KeyEvent.KEYCODE_BACK:
-                // 返回键逐层退出：焦点从胶囊收回画面 → 收底栏 → 关抽屉
-                if (inInfoBar()) {
-                    hideQualitySheet();
+                if (menuOpen) {
+                    // 规则 1：BACK 收起整个菜单（不论焦点在哪一块）
+                    closeMenu();
                     return true;
                 }
-                if (infoBar.getVisibility() == View.VISIBLE) {
-                    hideInfoBarNow();
-                    return true;
-                }
-                if (drawerOpen) {
-                    closeDrawer();
+                // 台标已并入左上角顶栏，跟着顶栏一起收起，不再单独一档
+                if (topBar.getVisibility() == View.VISIBLE) {
+                    ui.removeCallbacks(hideBar);
+                    topBar.setVisibility(View.GONE);
                     return true;
                 }
                 return super.onKeyDown(keyCode, event);
 
             case KeyEvent.KEYCODE_MENU:
             case KeyEvent.KEYCODE_INFO:
-                showBar();
-                openDrawer();
+                openMenu();
                 return true;
 
             case KeyEvent.KEYCODE_Z:
@@ -2545,50 +2873,175 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * 把焦点移到底部栏的清晰度胶囊上。
+     * 在频道列表里上下移动<b>焦点</b>（不切台，切台要按 OK）。
      *
-     * <p>OK 键呼出底栏时必须一并落焦：上下键已改为换台，
-     * 焦点若留在画面上，用户就没有任何路径能选中清晰度。
+     * <p>自己算下一行而不是交给 {@code super}，原因是系统的焦点导航
+     * 只按几何相邻找控件、并且"露出一点就算可见"：
+     * <ul>
+     *   <li>行贴到视口底部时，下一行只露出十几像素，焦点搜索找得到却跳不过去，
+     *       连续按 DOWN 到第 5 行后就彻底卡死（真机、模拟器都能复现）；</li>
+     *   <li>走到列表首/尾还可能横向窜到左栏分组导航上去。</li>
+     * </ul>
+     * 这里按 adapter 下标直接算目标行，并同步把目标行滚到垂直正中，
+     * 于是"再按一下会切到哪个台"始终看得见。
      *
-     * <p>落焦到<b>当前正在播的那一档</b>，而不是按线路下标猜：
-     * 胶囊是按清晰度去重后的视图，下标和 {@code sourceIndex} 并不同构。
+     * @param delta -1 向上 / +1 向下
+     * @return 恒为 true（列表内的上下键一律由这里接管）
      */
-    private void focusQualityPill() {
-        if (infoQualityRow.getChildCount() == 0) {
+    private boolean stepChannelFocus(int delta) {
+        if (listManager == null || channels.isEmpty()) {
+            return true;
+        }
+        int from = listManager.focusedPosition(getCurrentFocus());
+        if (from < 0) {
+            // 焦点行被 RecyclerView 回收掉时 getCurrentFocus() 已经不可靠。
+            // 不能用 current（那是"正在播放的台"）：用户可能从第 1 行往下
+            // 移焦点但并没有换台，用 current 当基准会一直算出同一行、原地打转。
+            from = lastFocusPos >= 0 ? lastFocusPos : Math.max(0, current);
+        }
+        int to = Math.max(0, Math.min(channels.size() - 1, from + delta));
+        if (to == from) {
+            return true;
+        }
+        moveChannelFocusTo(to);
+        return true;
+    }
+
+    /**
+     * 把焦点移到第 {@code position} 行，并把它滚到垂直正中（带滚动过渡）。
+     *
+     * <p>用 {@link CenteringLayoutManager#smoothCenterOn(int)} 而不是
+     * {@code centerOn()}：后者是硬切，按一下上下键画面"突然换一屏"，
+     * 用户看不出是滚过去的，只会觉得闪了一下。前者会补一段位移动画，
+     * 配合边缘透明度渐变，视觉上是内容在连续滚动。
+     *
+     * <p>顺序是「先落焦，再滚动」：落焦会触发系统要求"把这一行滚进可见区"，
+     * 那一步已经在 {@code requestChildRectangleOnScreen} 里被拦掉了，
+     * 所以随后的 {@code smoothCenterOn} 才是唯一决定位置的一方。
+     */
+    private void moveChannelFocusTo(int position) {
+        if (position < 0 || position >= channels.size()) {
             return;
         }
-        // 优先挑已选中（当前播放档）的那颗，没有就退回第一颗
-        View target = null;
-        for (int i = 0; i < infoQualityRow.getChildCount(); i++) {
-            View v = infoQualityRow.getChildAt(i);
-            if (v.isSelected()) {
-                target = v;
-                break;
+        lastFocusPos = position;
+        ui.post(() -> {
+            View row = listManager == null ? null : listManager.findViewByPosition(position);
+            if (row == null) {
+                // 行不在窗口里（跨了多行）：先把它带进来。
+                // 这一刻画面本来就是整屏换掉，补动画没有意义。
+                if (listManager != null) {
+                    listManager.centerOn(position);
+                }
+                ui.post(() -> {
+                    View again = listManager == null
+                            ? null : listManager.findViewByPosition(position);
+                    if (again != null) {
+                        requestFocusRobust(again);
+                    }
+                });
+                return;
             }
-        }
-        if (target == null) {
-            target = infoQualityRow.getChildAt(0);
-        }
-        final View focus = target;
-        // 刚 setVisibility(VISIBLE) 的视图要等一次布局才接受焦点
-        focus.post(() -> {
-            if (infoBar.getVisibility() == View.VISIBLE) {
-                focus.requestFocus();
+            smoothScrollPending = true;
+            requestFocusRobust(row);
+            if (listManager != null) {
+                listManager.smoothCenterOn(position);
             }
+            ui.postDelayed(() -> smoothScrollPending = false, 300);
         });
     }
 
-    /** 遥控器焦点是否落在底部信息条的分辨率胶囊上。 */
-    private boolean inInfoBar() {
+    /** 遥控器焦点是否落在左侧分组导航里。 */
+    private boolean inGroupList() {
+        if (drawer.getVisibility() != View.VISIBLE) {
+            return false;
+        }
         View f = getCurrentFocus();
         while (f != null) {
-            if (f == infoBar) {
+            if (f == groupList) {
                 return true;
             }
-            if (!(f.getParent() instanceof View)) {
-                return false;
+            Object p = f.getParent();
+            f = p instanceof View ? (View) p : null;
+        }
+        return false;
+    }
+
+    /**
+     * 在分组导航里上下移动焦点。
+     *
+     * <p>和 {@link #stepChannelFocus(int)} 同理：交给系统做的话，
+     * 走到最后一个分组再按 DOWN 会横向窜到右侧清晰度面板
+     * （实测落到 576P / 更多线路），菜单内的"上下选分组"就断了。
+     *
+     * <p><b>焦点移到哪个分组，右侧频道列表就立刻跟着切过去</b>——
+     * 用户要的是"翻着看"，而不是每换一个分组还要再按一次 OK 确认。
+     * 切换只换列表内容，不打断正在播放的画面（{@link #applyGroup(int)}
+     * 本身只管列表），也不关闭菜单。
+     */
+    private boolean stepGroupFocus(int delta) {
+        int from = -1;
+        View f = getCurrentFocus();
+        while (f != null) {
+            if (f.getParent() == groupList) {
+                from = groupList.getChildAdapterPosition(f);
+                break;
             }
-            f = (View) f.getParent();
+            Object p = f.getParent();
+            f = p instanceof View ? (View) p : null;
+        }
+        if (from < 0) {
+            from = currentGroup;
+        }
+        int to = Math.max(0, Math.min(groupNames.size() - 1, from + delta));
+        if (to == from) {
+            return true;
+        }
+        final int target = to;
+        ui.post(() -> {
+            // 列表跟随焦点切换（不关菜单、不切台）
+            if (target != currentGroup) {
+                applyGroup(target);
+            }
+            View row = groupList.getLayoutManager() == null ? null
+                    : groupList.getLayoutManager().findViewByPosition(target);
+            if (row != null) {
+                requestFocusRobust(row);
+            }
+            groupAdapter.setCurrent(target);
+        });
+        return true;
+    }
+
+    /** 遥控器焦点是否落在左侧频道列表里。 */
+    private boolean inDrawerList() {
+        if (drawer.getVisibility() != View.VISIBLE) {
+            return false;
+        }
+        View f = getCurrentFocus();
+        while (f != null) {
+            if (f == list) {
+                return true;
+            }
+            Object p = f.getParent();
+            f = p instanceof View ? (View) p : null;
+        }
+        return false;
+    }
+
+    /** 遥控器焦点是否落在右侧清晰度面板里。 */
+    private boolean inQualityPanel() {
+        if (qualityPanel.getVisibility() != View.VISIBLE) {
+            return false;
+        }
+        // 焦点停在档位项（或它的子 TextView）上，都不是 qualityPanel 本身，
+        // 所以必须沿父链比较，不能写成 f == qualityPanel。
+        View f = getCurrentFocus();
+        while (f != null) {
+            if (f == qualityPanel) {
+                return true;
+            }
+            Object p = f.getParent();
+            f = p instanceof View ? (View) p : null;
         }
         return false;
     }
@@ -2602,9 +3055,73 @@ public class MainActivity extends Activity {
         int next = ((index % size) + size) % size;
         sourceIndex = 0;
         retryRound = 0;
-        hideQualitySheet();
+        if (isMenuOpen()) {
+            closeMenu();
+        }
         dismissHint();
         play(next);
+    }
+
+    /**
+     * 菜单关闭时按上下键换台：<b>基准必须是"现在正在看的那台"</b>。
+     *
+     * <p>不能直接用 {@code current + delta}。{@code current} 是**列表焦点行**，
+     * 用户可能刚刚在菜单里翻到别的分组看了一眼就按 BACK 收起（没有选台），
+     * 这时 {@code current} 指向的是那个分组的第一行，而不是正在播的台。
+     * 实测症状（{@code build/t_step_base.py}）：正在播「延边卫视」，
+     * 打开菜单翻到「央视频道」再收起，按一次 DOWN 直接跳到了「北京卫视」——
+     * 用户眼里就是"按一下换台，跳了一个不相干的台"。
+     *
+     * <p>所以这里先按 {@link #playingName} 把基准找回来：
+     * <ul>
+     *   <li>正在播的台在<b>当前</b>分组 → 直接用它的行号；</li>
+     *   <li>不在（用户浏览过别的分组）→ 先把分组切回它所在的那一组，
+     *       再以它为基准上下走。用户按上下键的语义始终是
+     *       "在当前正在看的这个分组里换下一个台"。</li>
+     * </ul>
+     *
+     * @param delta +1 下一个 / -1 上一个
+     */
+    private void stepFromPlaying(int delta) {
+        if (master.isEmpty()) {
+            return;
+        }
+        // 先切回正在播的那一组，**再**判断列表是否为空。
+        // 顺序不能反：用户从空收藏分组收起菜单时 channels 是空的，
+        // 若先判 channels.isEmpty() 就直接返回，分组永远切不回去，
+        // 之后每次上下键都毫无反应（实测 `build/t_base2.py` 场景 C/D）。
+        ensurePlayingGroup();
+        if (channels.isEmpty()) {
+            return;
+        }
+        int base = indexOfName(playingName);
+        if (base < 0) {
+            // 还没播过任何台（playingName 为空）：按列表焦点行作基准。
+            // stepChannel 内部会对下标取模，-1 会自然回绕到最后一个台。
+            base = Math.max(0, current);
+        }
+        stepChannel(base + delta);
+    }
+
+    /**
+     * 把列表切回「正在播放的那个台所在的分组」。
+     *
+     * <p>用户可能在菜单里翻到别的分组看了一眼就按 BACK 收起（没有选台），
+     * 此时 {@link #channels} 装的是那个分组的内容，而正在播的台在另一组。
+     * 菜单关闭后所有"按列表下标"的操作（上下换台、数字键跳台）都必须先
+     * 把列表切回来，否则下标指到的是用户"看过但没选"的那一组。
+     */
+    private void ensurePlayingGroup() {
+        if (master.isEmpty() || TextUtils.isEmpty(playingName)) {
+            return;
+        }
+        if (indexOfName(playingName) >= 0) {
+            return;   // 正在播的台就在当前列表里，不用动
+        }
+        int want = groupNames.indexOf(channelGroup(playingName));
+        if (want >= 0 && want != currentGroup) {
+            applyGroup(want);
+        }
     }
 
     @Override
@@ -2626,6 +3143,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         ui.removeCallbacksAndMessages(null);
+        VirtualRemote.release(this);
         if (player != null) {
             player.release();
             player = null;

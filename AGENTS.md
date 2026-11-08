@@ -140,12 +140,30 @@ PROBE_TOTAL_MS = 4500   // 所有线路的总预算，到点才返回
 - `Channel.sortBySpeed()`：清晰度降序，同清晰度内 `response-time` 升序
 - 默认频道从 index 0 改为优先 `CCTV-1`（index 0 往往是冷门坏台）
 
-### 抽屉焦点预览
+### 抽屉焦点居中（原「焦点预览卡」已删除）
 
-- 布局新增 `previewCard`（画面右下角：台标 + 频道名 + 分组 + 线路数）
-- `setupFocusPreview()` 挂 `OnGlobalFocusChangeListener`：
-  焦点在频道行上移动时实时预览，离开列表/切台/关抽屉即收起
-- 正在播放的台不弹预览（用户已经在看了）
+早期在画面右下角做过一张 `previewCard`（焦点频道的台标 + 频道名 + 分组 +
+线路数），由 `setupFocusPreview()` 挂 `OnGlobalFocusChangeListener` 实时刷新。
+它和"正在播放"的 `infoBar` 各自一套逻辑、又都锚在右下角，实测两张卡互相穿插
+（`build/t2.png`），用户分不清哪个是正在看的台——**这张卡现在整个删掉了**。
+
+保留下来的是同一个监听器的另一半职责：焦点在频道行上移动时把那一行
+**滚到垂直正中**（规则 5）。方法因此改名为 `setupFocusCentering()`：
+
+```java
+list.getViewTreeObserver().addOnGlobalFocusChangeListener((oldFocus, newFocus) -> {
+    if (newFocus != null && isInside(newFocus, list)
+            && listManager != null && !smoothScrollPending) {
+        int pos = listManager.focusedPosition(newFocus);
+        if (pos >= 0) {
+            listManager.smoothCenterOn(pos);
+        }
+    }
+});
+```
+
+- 台标只有左上角顶栏那一处，见下文「台标只有一处」。
+- 右下角只剩虚拟遥控器（仅 debug 包），没有任何信息卡。
 
 ### 优先高清 + 卡顿降档 + 不来回切（本轮核心）
 
@@ -274,20 +292,435 @@ B 台的自动降档和精修不该被 A 台的操作一起冻住——B 台可�
 > 合并脚本 `build/merge_seed.py`：best-fan 优先，旧 seed 补全不重复的线路。
 > 注意 `[S]` 后缀（如 `CCTV1[1080][S]`）不会拆台：`qualityOf()` 取第一个括号。
 
-### 遥控器按键（本轮按要求重排）
+### 遥控器按键（本轮规则，用户明确定义，勿回退）
 
-| 键 | 行为 |
-|----|------|
-| **上 / 下** | 上/下一个频道 |
-| **左 / 右** | 打开左侧抽屉（分组 + 频道列表） |
-| **OK / 确认** | 打开底部信息条，并把焦点落到当前清晰度胶囊 |
-| **BACK** | 逐层退出：胶囊 → 底栏 → 抽屉 |
+**左右两块面板是一个整体菜单**：OK 键同时叫出左侧频道抽屉 + 右侧清晰度面板，
+也同时消失。左右键**不再**单独打开某一个面板——它们只负责在菜单内部移动焦点。
 
-- 抽屉打开后焦点落到**当前频道行**，`focusDrawerList()` 带 6 次重试：
+| 键 | 菜单未打开 | 菜单打开时 |
+|----|-----------|-----------|
+| **OK / 确认** | 打开完整菜单（左抽屉 + 右清晰度），焦点落当前频道 | 交给焦点所在项（选台 / 选清晰度 / 切分组） |
+| **上 / 下** | 上/下一个频道 | 在菜单内移动焦点（分组栏里移动即**自动切分组**） |
+| **左 / 右** | 不打开菜单 | 在左右两块面板之间跳焦点 |
+| **BACK** | 退出应用 | 收起整个菜单 |
+
+> 菜单打开时从**频道列表**按左**两次**才进分组栏：第一次交给焦点导航
+> 从行内子 View 退到行本身，第二次才跨到分组栏。这是实测结论，
+> 写自动化脚本时必须按这个次数走，否则会误判成"左键进不去分组"。
+
+#### 规则原文（用户 2026-11-08 定，后续改动必须逐条对照）
+
+1. **按 OK 键左右侧同时出来**，同时出现或同时消失，作为**一个完整菜单**显示，
+   不再分两个不同逻辑；左右键不再单独打开某一个面板。
+2. **上下键切换频道**，但**只有左右菜单没出现时**才是切换频道。
+3. 菜单（左频道列表 + 右清晰度）出现时，上下左右键**用于在菜单内选择**，
+   左菜单可以跳到右侧清晰度选项——两块是一体的。
+4. 右侧清晰度菜单**宽度要小**，不需要那么宽。
+5. 左侧菜单必须**保证选中的频道行永远可见**，即自动滚动到当前选中项。
+6. **定期刷新**：每次打开 App 后台自动刷新频道列表，
+   **无效的频道和无效的清晰度线路自动移除**。
+7. 底部栏**可以调小**，直接在**右下角跟随左右菜单一起显示**，不再单独展示。
+
+#### 实现要点
+
+- 菜单开关只有一个入口 `openMenu()` / `closeMenu()`，抽屉和清晰度面板必须同生同灭。
+  任何"只关一个"的写法都会留下半套 UI（例如没有频道的清晰度面板悬在右边）。
+- `inQualityPanel()` / `inDrawer()` 都算"菜单打开"，上下键的分流必须同时判断两者。
+- 左右键是对称的焦点搬运：右键把焦点送进清晰度面板，左键把它搬回频道列表。
+- 规则 7 的底栏现在是**抽屉自身底部的一行**（`drawerSub`：`分组 · 数量` +
+  更新时间），跟抽屉同生同灭，不再有独立的 `bottomArea` / `infoBar`。
+  `updateDrawerInfo()` 负责写这一行。
+- 抽屉落焦后必须 `scrollCurrentIntoComfort(current)`，保证当前频道行不被裁在视口外
+  （规则 5）。`focusDrawerList()` 的 6 次重试就是为了这一点：
   抽屉刚 `setVisibility(VISIBLE)` 时 `RecyclerView` 还没布局，
   一次性 `requestFocus()` 会静默失败（实测焦点停在 `root` 上）。
-- OK 键必须同时 `focusQualityPill()`：上下键已改为换台，
-  焦点留在画面上就再也选不到清晰度了。
+- 清晰度面板落焦目标是**已 selected 的那一行**，不是按下标猜——
+  面板是按 `displayKey()` 去重后的视图，和 `sourceIndex` 不同构。
+
+#### 台标只有一处：左上角顶栏里的 `infoLogo`
+
+**用户原话**："右下角的 logo 有 2 个，你排查下是否有多个逻辑让他出现了，
+你把这两个逻辑删除"。
+
+之前右下角确实有**两个** `ImageView` 叠在一起，各自一套显隐逻辑：
+
+| 视图 | 逻辑 | 说明 |
+|------|------|------|
+| `previewLogo` | `setupFocusPreview()` + `previewFor()` + `renderPreviewCard()` + `hidePreviewCard()` | 焦点移到哪一行就显示那一台的台标（"即将切到的台"） |
+| `infoLogo` | `renderInfoBar()` + `showInfoBar()` / `hideInfoBarNow()` + `HIDE_INFO_BAR_MS` 计时器 | 正在播放的台（"现在在看的台"） |
+
+两套逻辑互不知情，用户看到的是一台机器上同时出现"待切台"和"在播台"
+两个台标，分不清哪个是真的在播。
+
+现在**只保留一处**：
+
+- 整个 `bottomArea`（含 `previewLogo`、`infoBar`）从 `activity_main.xml` 删除；
+- `infoLogo` 移进 `topBar`，作为 `nowName` 前面的第一项
+  （`88dp × 44dp`、`layout_marginEnd=16dp`、默认 `gone`）；
+- `previewLogo` 及其全部方法、`HIDE_INFO_BAR_MS` / `hideInfoBar` /
+  `showInfoBar()` / `hideInfoBarNow()` 全部删除；
+- `setupFocusPreview()` 改名为 `setupFocusCentering()`，只保留焦点行居中。
+
+台标的**可见性完全跟随顶栏**，不再有独立的淡出计时器：顶栏由
+`showBar()` / `hideBar` 统一管理（`HIDE_BAR_MS = 6000`），
+BACK 键收起时判断的是 `topBar.getVisibility()`。
+
+实测（`build/t_logo.py`，1280×720）：全屏只有一个 `ImageView`：
+
+```
+topBar     bounds=[0,0][1280,54]
+infoLogo   bounds=[20,14][70,39]     ← 左上角，紧贴台名
+nowName    bounds=[79,12][163,41]
+nowMeta    bounds=[187,17][1144,36]
+```
+
+#### 规则 5 的滚动：居中 + 平滑过渡 + 边缘淡出
+
+`scrollCurrentIntoComfort()` 早期实现是无条件
+`scrollToPositionWithOffset(pos, 0)`——每次都把选中行硬顶到列表首行。
+后果是用户在抽屉里连续上下移动焦点时列表一直抖，本来好好待在视口中间的行
+也被拽到最上面，观感很跳。
+
+现在分两条路：
+
+| 场景 | 入口 | 行为 |
+|------|------|------|
+| 结构性变化（开菜单、切分组、跨多行跳） | `CenteringLayoutManager.centerOn()` | 瞬移，一次性摆到正中 |
+| 上下键逐行移动 | `CenteringLayoutManager.smoothCenterOn()` | 摆到正中 + 补一段位移过渡 |
+
+##### 平滑滚动为什么不用现成的两个 API（都试过，都不行）
+
+**1. `smoothScrollToPosition()` / `LinearSmoothScroller`**
+
+内置「够可见就不动」的启发式。实测连按 DOWN，前 4 次按键焦点行只
+**单帧跳 92px**，第 5 次才有动画——用户看到的是"有时丝滑、有时硬切"。
+而且默认速度是按 `MILLISECONDS_PER_INCH / densityDpi` 算的，
+320dpi 下约 `0.31ms/px`，滚一行 93px 只给 **29ms**，25fps 录屏里不足一帧。
+
+**2. `ValueAnimator` + `RecyclerView.scrollBy()` 逐帧驱动**
+
+动画值确实在走，`dy=-204/-111/-18/75` 都算对了，
+但 `scrollBy` 会和 RecyclerView 的待布局请求打架——
+滚动量被随后的布局按锚点算回去，**画面一帧都不动**。
+
+##### 现在的做法：真实滚动瞬时完成，视觉位移用 `translationY` 补
+
+1. `scrollToPositionWithOffset()` 把目标行立刻摆到正中（一步到位，可靠）；
+2. 在 `onLayoutCompleted()` 里用 `contentOffset()` 的前后差值算出
+   「内容实际移动了多少」（`delta`，正数=内容往上滚）；
+3. 把所有行 `translationY` 设成 `+delta`（看起来还停在旧位置），
+   再用 `ValueAnimator` 动画回 0。
+
+平移只影响绘制、不影响布局，因此不会被布局管线吞掉，
+**每一次**按键都有同样的动画。
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `MS_PER_PX` | `1.5f` | 一行约 93px → 140ms ≈ 4 帧，眼睛能明确看到运动 |
+| `MIN_ANIM_MS` / `MAX_ANIM_MS` | `120` / `260` | 太短像跳、太长连按积压 |
+| `DecelerateInterpolator(1.6f)` | — | 起手快、落点稳 |
+| `FADE_BAND_DIVISOR` | `6` | 上下各 1/6 视口做淡出带，中间 2/3 全实 |
+| `EDGE_MIN_ALPHA` | `0.30f` | 边缘行最低不透明度 |
+
+##### 四个必须记住的坑
+
+**坑 1：`ValueAnimator` 第一次回调要等下一个 vsync。**
+`startOffsetAnim()` 里必须**立刻** `applyOffset(currentOffset)` 一次，
+否则本次布局这一帧会先按"终态"画出来（录屏里是一帧 `+94` 的跳变），
+下一帧才补上位移，看起来像"先跳一下再倒回来"。
+
+**坑 2：补偿量符号是 `+delta`，不是 `-delta`。**
+`delta > 0` 表示内容已经向上滚了；要让这一帧看起来停在旧位置，
+绘制位移必须是 `+delta`（`translationY` 正方向朝下）。
+写反了的表现是"内容先跳到目标位置，再倒着滑回旧位置"。
+
+**坑 3：位移量不能量目标行。**
+`scrollToPositionWithOffset()` 只是挂一个待处理滚动，它要到**下一次布局**
+才生效；而 `onLayoutCompleted()` 可能先被一次无关的布局（落焦引起的重排）
+调用，那时 `findViewByPosition(target).getTop()` 还是旧值，`delta=0`。
+必须用 `contentOffset()`（`首个子 View 的位置 × 平均行高 - top`），
+并且 `pendingPosition` **不能**在一次 `delta=0` 的布局后就清掉，
+要等 `PENDING_MAX_ATTEMPTS = 4` 次仍为 0 才放弃。
+
+**坑 4：`computeVerticalScrollOffset()` 需要传 `State`。**
+`LinearLayoutManager` 上的那个重载在布局回调外拿不到 `State`，
+所以自己写了 `contentOffset()`。
+
+##### 连续快速按键不回弹
+
+`smoothCenterOn()` **不停**上一个动画：`pendingOffsetBefore` 记的是
+真实布局位置，`currentOffset` 仍在更新，布局回调里用
+`currentOffset + delta` 作新起点，位移于是从眼睛看到的当前位置接着走。
+实测按键间隔 260ms（短于动画时长）连按 5 次，
+`dy` 序列恒为同号递减（`-32 -24 -16 -10 -6 -4 -2`），没有变号回弹。
+
+##### 开合菜单 / 切分组必须清残留平移
+
+`cancelScrollAnim()` 要在这三处调用，否则残留的 `translationY`
+会让重新出现的列表整体偏半行（像第一行被裁掉一截）：
+`openMenu()`、`closeMenu()`、`applyGroup()`。
+
+##### 验证方法（`uiautomator dump` 采不到 200ms 级动画）
+
+必须 `screenrecord` 录屏 + 逐帧检测**蓝色焦点高亮块**（`#F23D8BFD`）
+的 top 坐标。用帧差法会被背景视频干扰，不可靠。
+
+判定标准：瞬移 = 单帧跳满一行（`+92/+94`）；平滑 = 多帧递减
+（`-30 -24 -17 -11 -6 -4 -2`）。脚本见 `build/t_track.py`（滚动）、
+`build/t_fade.py`（边缘淡出，量各行亮度比）。
+
+##### 模拟器上的测试前提（踩过多次）
+
+- **点分组名只移焦点，不切分组**，必须再按一次 OK。
+- 不切到「央视频道」的话默认分组只有 1 个台，按 DOWN 什么都不会发生。
+- **列表开头几行没有滚动余量**，居中不了、也就没有滚动动画可看，
+  必须先按 5 次把它推到中部再录屏。
+- 菜单关闭时按 BACK 会**退出应用**（`onKeyDown` 走 `super`），
+  脚本里不能先 BACK 去收底栏。
+
+#### 频道行居中的实现（`CenteringLayoutManager`）
+
+继承 `LinearLayoutManager`，`requestChildRectangleOnScreen()` 返回 `false`
+关掉系统那套「滚到可见」，滚动只由本类驱动。原因：默认行为下
+焦点走到最下面一行时，RecyclerView 把下一行滚到只露出一条边就停手，
+那一行「算可见」又没完整布局，焦点搜索找得到却跳不过去——
+连续按 DOWN 到第 5 行就彻底卡死（真机、模拟器都能复现）。
+
+`focusedPosition(view)` 沿父链找焦点所在行，因为焦点实际落在行内的子 View 上。
+
+#### 规则 6：死线路黑名单（`DeadSources`）
+
+节目单里相当一部分线路是死的（机房下线、切片 404、或只有 100~300 KB/s
+而 1080 要 1 MB/s）。每次换台重新踩一遍，用户看到的就是"切过去黑屏十几秒
+再自己换回来"。
+
+`DeadSources` 把**已被真实播放证伪**的地址落盘，`ChannelStore.load()` 里
+`dropDead()` 直接剔除：
+
+| 字段 | 值 |
+|------|-----|
+| SharedPreferences | `dead_sources` |
+| TTL | 3 天（过期的 `isDead()` 顺手清掉，重新给一次机会） |
+| 上限 | 3000 条，超了按时间戳淘汰最老的 |
+
+判死证据只有三种，**都来自播放而不是一次速度探测**（探测测的是分片开头的
+突发速率，能比真实持续速率高四五倍，用它判死会把好源误杀）：
+
+- 起播看门狗超时 → `startup-timeout`
+- 分片跳号 `starved` → `chunk-jump`
+- 反复缓冲降档
+
+反向也必须留：`STATE_READY` 真正出画面时调 `DeadSources.revive(url)`，
+免得一次临时断网造成的误判永久生效。
+
+**`dropDead()` 的保底**：每条线路都死时**保留第一条**。宁可让用户看到
+"该频道暂时无法播放"，也好过频道直接从节目单里蒸发——后者会让分组里
+少一个台，用户以为节目单坏了。
+
+#### 规则 6：每次启动都刷新
+
+`refreshIfStale()`（只在缓存过期 24h 时才拉）已换成 `refreshInBackground()`：
+**每次打开 App 都拉**。原来用户一天内第二次打开完全不刷新，坏掉的线路
+永远留在列表里。
+
+- 拉取在后台线程（`iptv-startup-refresh`），不挡起播；
+- 失败也调 `reloadKeeping()`——让 `dropDead()` 的黑名单生效，
+  即使这次没拉到新数据，"剔除坏线路"这件事也该做。
+
+### 「正在播放」只能按频道名判定，绝不能按下标
+
+**这是本轮最严重的一个语义 bug，两个症状来自同一个根因。**
+
+`current` 早先同时承担两种语义：
+
+1. 「正在播的台在 `channels` 里的下标」；
+2. 「抽屉里列表焦点落在第几行」。
+
+两者只在「菜单打开、且正在浏览正在播的那个分组」时才碰巧相等。一旦用户
+切到别的分组浏览（这是最常见的操作），它们就分叉了。
+更糟的是 `applyGroup()` 里有 `current = Math.max(0, found)` ——
+正在播的台不在新分组里时 `found = -1`，被夹成 `0`，于是：
+
+- **症状 A**：列表第一行被标上「正在播放」，而实际在播的是另一个分组里的台。
+  用户打开一个不含正在播频道的分组，就看到"第一个永远是正在播放"。
+- **症状 B**：降档（`lowerQualityInstead`）、换源（`repickSource`）、
+  重开流（`onSilentStall` / `recoverPlayback`）、分片跳号判死（`noteChunk`）、
+  实测清晰度落盘（`rememberRealQuality`）、清晰度状态日志（`qualityState`）
+  全都作用到 `channels.get(current)` —— 也就是**用户正在浏览的那一行**，
+  而不是**真正在播的那一台**。用户看到的是"降档没生效""换了源还是卡"。
+
+修法是彻底拆开，三条不变量：
+
+| 字段 | 唯一语义 |
+|------|----------|
+| `current` | 列表焦点行下标，**允许 -1**（本分组没有正在播的台） |
+| `playingName` | **正在播放的唯一权威**，跨分组稳定 |
+| `playingRef` | 播放器真正在用的 `Channel` **实例** |
+
+1. **`ChannelAdapter` 按名字判定**：`setCurrent(int)` 换成 `setPlaying(String)`，
+   `onBindViewHolder` 里 `playingName.equals(c.name)` 决定是否显示胶囊和
+   `setActivated`。名字对不上就**一条都不标**，这才是实事求是。
+2. **播放侧一律 `playingChannel()`**，返回 `playingRef`。不用
+   `indexInMaster(playingName)` 重新找对象：节目单每次刷新都会解析出**全新的
+   Channel 对象**，线路顺序甚至数量都可能变，`sourceIndex` 会指到另一条 URL 上。
+3. **`applyGroup()` 里 `current` 该夹到 0 就夹到 0**（方向键要有落点），
+   但**绝不**把那一行标成正在播放。
+
+#### 验证脚本为什么之前一直"验证通过"（假的）
+
+`virtual remote` 的按键坐标**不是固定的**：菜单关闭时它在屏幕中偏右
+（`OK=(957,493)`），菜单打开时会横移让开右侧清晰度面板
+（`OK=(1162,493)`）。脚本里写死一套坐标，菜单一开所有点击都落到别处，
+表现为"按了没反应"或"点到了别的控件"——而脚本只看自己 dump 出来的焦点，
+于是误判成通过。
+
+现在统一走 `build/rc.py`：**每次按键前先 dump 一次，用按键文字
+（`▲▼◀▶ OK 返回`）查出当前真实坐标再点**。
+
+另外 `正在播放` 胶囊是 `ChannelAdapter.addChip()` 里 `new TextView(ctx)`
+动态创建的，**没有 resource-id**。想按 id 过滤会把它全部滤掉，
+必须按几何位置归组：文本中心同时落在 `id/row` 矩形与 `id/list` 矩形内。
+`id/list` 那层判断是必要的——右下角虚拟遥控器的按键文字会和底部行 y 轴重叠。
+
+### 「正在播放」误标：已实测确认的结论
+
+| 场景 | 结果 |
+|------|------|
+| 央视频道（在播 CCTV-5） | 标记只有 `CCTV-5` |
+| 卫视频道（不含在播台） | **一行都不标** |
+| 切回央视频道 | 标记仍是 `CCTV-5` |
+| 跨分组浏览一趟再回来 | 标记仍是 `CCTV-5`，与顶栏 `nowName` 完全一致 |
+| 菜单关闭时 DOWN×4 | 顶栏 `CCTV-2 → CCTV-3 → CCTV-4 → CCTV-5`，确实换台 |
+
+### 分组归属：投票，不是"第一条说了算"
+
+`PlaylistParser.parse()` 原实现用**第一条**线路的 `group-title` 决定
+整个频道的分组。但上游清单里同一频道的各条线路分组写法并不统一
+（实测 `build/cache2.m3u8`，256 条线路）：
+
+| 频道 | 分组分布 |
+|------|----------|
+| `CCTV1` | 央视频道 ×5，**General ×1** |
+| `CCTV5` | 央视频道 ×7，体育频道 ×1 |
+| `CCTV-13` | 央视频道 ×1，News ×1 |
+| `CCTV-14` | 央视频道 ×2，无分组 ×1 |
+
+谁排前面纯属生成顺序。于是 CCTV-1 会因为那单独一条 `General`
+被整个搬进一个叫 `General` 的独立分组——分组栏里凭空多出一项，
+用户在自己的「央视频道」里找不到 CCTV-1。
+
+现在改成**两遍解析**：
+
+1. 第一遍只收集 `Entry`（key / 显示名 / 原始分组 / logo / 清晰度 / 响应耗时 / URL）；
+2. `voteGroups()` 对每个频道的分组**按票数取多数**，然后才创建 `Channel`。
+
+有效分组优先：`ChannelGroups.isPlaceholderGroup()` 认定的占位名
+（`General` / `News` / `Other` / `Misc` / `Undefined` / `Default`）
+**不算票**，即使票数更多也不采纳。全部线路都是占位名时才回退到原始值，
+再交给 `canonical()` 收敛成「其他频道」。
+
+离线按同样规则复算 `cache2.m3u8` 的结果（`build/g_check.py`）：
+
+```
+有效线路: 256    频道数: 57
+分组分布: 卫视频道 34 / 央视频道 18 / 其他频道 4 / 卡通频道 1
+占位分组残留: 无 -> PASS
+重复显示名:   无 -> PASS
+CCTV-1 group=央视频道 线路=6      CCTV-5 group=央视频道 线路=8
+CCTV-9 group=央视频道 线路=7      CCTV-13 group=央视频道 线路=13
+```
+
+#### `(576i)` 后缀必须和 `(720p)` 一样剥掉
+
+`cleanName()` 原来只认 `p` 后缀。节目单里有 `CCTV-9 (576i)`，
+`normalize()` 之后得到 `CCTV9(576I)`，与正常的 `CCTV9` 是**两个键**，
+于是分组里出现两个 CCTV-9（一个干净名、一个带 `(576i)`）。
+现在正则同时认 `[pPiI]`，`qualityFromName()` 也一并改了。
+
+### 规则 2 的延伸：分组焦点移动 → 列表自动跟随
+
+用户原话："分类切换时频道列表要跟随自动切换，不需要用户再点 OK 确认"。
+
+`stepGroupFocus()` 原来只 `groupAdapter.setCurrent(target)` 移焦点，
+列表纹丝不动，必须再按 OK 才切分组。现在移焦点的同时直接
+`applyGroup(target)`：
+
+- 只换列表内容，**不打断正在播放的画面**（`applyGroup` 本身只管列表）；
+- **不关闭菜单**——用户是在"翻着看"；
+- 焦点**留在分组栏**，不会被抢到频道列表（`requestFocusRobust(row)` 之后
+  才 `setCurrent`，顺序不能反）；
+- OK 仍然可用，落到频道列表选台，行为不变。
+
+实测（`build/t_final1.py` / `t_play6.py`）：连按 4 次 DOWN，
+列表依次变成 央视 18 台 → 卫视 34 台 → 卡通 1 台 → 其他 4 台，
+底栏 `drawerSub` 同步更新。
+
+### 菜单关闭后的换台基准：必须相对"正在播放的台"
+
+这是 `current` 语义分离之后的**第二个后遗症**，也是本轮最后一个真 BUG。
+
+用户操作很常见：
+
+1. 正在看 CCTV-3；
+2. 按 OK 打开菜单，往下翻到「卫视频道」看两眼（列表跟着切过去了）；
+3. 没选台，直接按 BACK 收起菜单；
+4. 按一下 DOWN，想换到 **CCTV-4**。
+
+原实现是 `stepChannel(current + 1)`，而 `current` 此刻是「卫视频道」的第一行，
+于是换过去的是**北京卫视**——用户眼里就是"按一下换台，跳了个毫不相干的台"。
+数字键跳台同理：`channels.get(n-1)` 取的是浏览分组的第 n 个台。
+
+修法是先"把基准找回来"，见 `ensurePlayingGroup()` + `stepFromPlaying()`：
+
+```java
+private void ensurePlayingGroup() {
+    if (master.isEmpty() || TextUtils.isEmpty(playingName)) return;
+    if (indexOfName(playingName) >= 0) return;      // 正在播的台就在当前列表
+    int want = groupNames.indexOf(channelGroup(playingName));
+    if (want >= 0 && want != currentGroup) applyGroup(want);
+}
+```
+
+上下键 / CHANNEL_UP / CHANNEL_DOWN / 触摸滑动 / 数字键**全部**先过它，
+再按 `indexOfName(playingName)` 当下标基准。
+
+#### 顺序陷阱：`ensurePlayingGroup()` 必须在 `channels.isEmpty()` 判断之前
+
+第一版写成：
+
+```java
+if (master.isEmpty() || channels.isEmpty()) return;   // ← 错
+ensurePlayingGroup();
+```
+
+后果是**在空收藏分组里收起菜单后，上下键彻底失效**：收藏是空的，
+`channels` 为空直接 return，分组永远切不回去，之后每次按键都没反应。
+用户感受就是"按上下键没动静，必须再开一次菜单才能恢复"。
+
+正确顺序是先切回正在播的那一组，再判断列表空不空（实测 `build/t_base2.py`
+场景 C 就是这条回归）。
+
+| 场景 | 期望 | 实测 |
+|------|------|------|
+| 播 CCTV-3，浏览卫视后收起，按 DOWN | `CCTV-4`（同分组下一台） | ✅ |
+| 播 CCTV-4，浏览卡通频道后收起，按数字 `2` | `CCTV-2` | ✅ |
+| 播 CCTV-2，进空收藏分组后收起，按 DOWN | `CCTV-3`（不崩、不失效） | ✅ |
+| 不浏览分组时 DOWN → UP | 相邻切换且能回退 | ✅ |
+
+验证脚本：`build/t_base2.py`（A/B/C/D 四段全 PASS）。
+
+### 清晰度面板为什么移到右侧
+
+原来清晰度是横排在底部信息条里的胶囊，问题有三个：
+
+1. 线路一多就得横向滚动（CCTV-1 有十几个备胎），遥控器不好找；
+2. 底栏同时承担「我在看什么」和「换个清晰度」两件事，语义混在一起；
+3. OK 键要负责呼底栏 + 落焦胶囊，上下键又是换台，按键语义绕。
+
+现在右侧面板：贴右缘竖排，每档一行，宽度只占屏幕 16%（够放 `1080P` 四个字），
+样式与左侧抽屉同源（`quality_row_bg.xml` / `quality_text.xml` 对齐
+`group_bg.xml` / `group_text.xml`：10dp 圆角、焦点实心蓝、选中淡蓝 + 描边）。
+档位少时 `wrap_content` 紧贴内容，档位多时 `ScrollView` 限高到屏幕 72% 自己滚。
 
 ---
 
@@ -330,6 +763,31 @@ B 台的自动降档和精修不该被 A 台的操作一起冻住——B 台可�
 - [ ] 换台后不再冻屏（`resetForNewStream` 生效）
 - [ ] 坏台（CETV-1）4 轮后放弃并提示
 - [ ] 抽屉内焦点移动能看到预览卡
+
+#### 七条菜单规则：模拟器已回归（2026-11-08）
+
+| 规则 | 结论 | 证据 |
+|------|------|------|
+| 1 OK 同开同关 | ✅ | `build/x2.png` 左右面板 + 右下底栏同时出现；`build/x4.png` BACK 后全部消失 |
+| 2 菜单外上下键换台 | ✅ | `build/u1.png` 菜单关闭时 DOWN 只换台，不弹菜单 |
+| 3 菜单内四向导航 | ✅ | `build/x3.png` 右键把焦点送进 576P 档（实心蓝） |
+| 4 右侧面板窄化 | ✅ | 16% 宽，`1080P`/`576P` 完整不裁 |
+| 5 选中行自动可见 | ✅ | `build/v1.png` 连按 6 次 DOWN，CCTV-11 完整露出 |
+| 6 启动刷新 + 剔死源 | ✅ | 日志有 `auto-refresh ok channels=58`、`drop-dead`、`dead_sources.xml` 落盘 |
+| 7 底栏缩小跟随菜单 | ✅ | 底栏贴右下角 `wrap_content`；菜单关后 `build/x4.png` 不再常驻 |
+
+#### release 包（虚拟遥控器隐藏）
+
+`assembleRelease` 通过并装机验证（`build/x1.png` → `build/x4.png`）：
+
+- [x] 画面里没有虚拟遥控器
+- [x] 设置菜单里没有"虚拟遥控"这一项（`VirtualRemote.attach()` 在非
+      `FLAG_DEBUGGABLE` 包直接 return，`available()` 恒为 false）
+- [x] 菜单开合、左右键焦点搬运、BACK 收起全部正常
+
+> 剩余未验证项都是**真机专属**（记忆线路起播速度、冻屏、坏台放弃），
+> 模拟器无 MP2 解码器（有画面无声音），且远程源只能连 `gh-proxy.com`，
+> 分组名是英文 `General` 而非内置 seed 的中文分组。
 
 ---
 

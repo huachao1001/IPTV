@@ -1,5 +1,7 @@
 package com.iptv.live;
 
+import com.iptv.live.source.DailyRefresh;
+
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;

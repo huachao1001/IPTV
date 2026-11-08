@@ -1,4 +1,4 @@
-package com.iptv.live;
+package com.iptv.live.play;
 
 import androidx.media3.common.util.UnstableApi;
 import androidx.media3.exoplayer.mediacodec.MediaCodecInfo;

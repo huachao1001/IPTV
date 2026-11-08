@@ -1,4 +1,6 @@
-package com.iptv.live;
+package com.iptv.live.ui;
+
+import com.iptv.live.model.ChannelGroups;
 
 import android.content.Context;
 import android.view.LayoutInflater;
@@ -10,6 +12,7 @@ import androidx.annotation.NonNull;
 import androidx.recyclerview.widget.RecyclerView;
 
 import java.util.List;
+import com.iptv.live.R;
 
 /** 左侧分组导航（我的收藏 / 央视频道 / 卫视频道 ...）。 */
 public class GroupAdapter extends RecyclerView.Adapter<GroupAdapter.VH> {

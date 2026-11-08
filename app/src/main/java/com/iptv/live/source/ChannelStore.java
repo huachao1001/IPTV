@@ -1,4 +1,7 @@
-package com.iptv.live;
+package com.iptv.live.source;
+
+import com.iptv.live.model.Channel;
+import com.iptv.live.model.ChannelGroups;
 
 import android.content.Context;
 import android.content.SharedPreferences;
@@ -114,9 +117,43 @@ public final class ChannelStore {
                 throw new IOException("播放列表为空");
             }
             applyRemembered(list);
+            // 规则 6：把已被真实播放证伪的线路剔除掉，换台时不再反复踩死源。
+            // 必须放在"频道至少留一条"的前提下剔除，否则整台会从列表里消失
+            dropDead(list);
             return list;
         } finally {
             in.close();
+        }
+    }
+
+    /**
+     * 剔除 {@link DeadSources} 里记录的坏线路。
+     *
+     * <p>每条线路都死时**保留第一条**：宁可让用户看到"该频道暂时无法播放"，
+     * 也好过频道直接从节目单里蒸发——后者会让分组里少一个台，
+     * 用户以为节目单坏了。分批删而不是边遍历边删，避免迭代器失效。
+     */
+    private void dropDead(List<Channel> list) {
+        for (Channel c : list) {
+            if (c.sources.size() <= 1) {
+                continue;
+            }
+            List<Channel.Source> alive = new java.util.ArrayList<>(c.sources.size());
+            for (Channel.Source s : c.sources) {
+                if (!DeadSources.isDead(ctx, s.url)) {
+                    alive.add(s);
+                }
+            }
+            if (alive.isEmpty()) {
+                continue;
+            }
+            if (alive.size() != c.sources.size()) {
+                android.util.Log.i("IPTVSTORE", "drop-dead ch=" + c.name
+                        + " removed=" + (c.sources.size() - alive.size())
+                        + " left=" + alive.size());
+                c.sources.clear();
+                c.sources.addAll(alive);
+            }
         }
     }
 

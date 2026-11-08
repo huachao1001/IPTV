@@ -1,4 +1,4 @@
-package com.iptv.live;
+package com.iptv.live.play;
 
 import android.content.Context;
 import android.os.Handler;

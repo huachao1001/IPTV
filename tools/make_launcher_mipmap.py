@@ -49,17 +49,22 @@ spec.loader.exec_module(launcher)
 
 CHROME = Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
 
-# 各密度对应的启动图标边长（dp ≈ px 换算后 launcher 实际取用的尺寸）
+# 各密度对应的启动图标边长。
+#
+# 这里按**两倍**标准尺寸出图（标准 48dp，小米电视桌面实际画 96dp）：
+# 实测 1920x1080 / density 320 的小米电视桌面，图标格子是 192px，
+# 而 320dpi 走 xhdpi 桶。若 xhdpi 只给标准 96px，就会被放大 2 倍显示 —— 这正是
+# 「图标看着模糊」的原因。每个桶都给到两倍像素，launcher 就是 1:1 取用。
 DENSITIES = {
-    "mdpi": 48,
-    "hdpi": 72,
-    "xhdpi": 96,
-    "xxhdpi": 144,
-    "xxxhdpi": 192,
+    "mdpi": 96,
+    "hdpi": 144,
+    "xhdpi": 192,
+    "xxhdpi": 288,
+    "xxxhdpi": 384,
 }
 
 # 先按大尺寸渲染再降采样，边缘比直接渲染小图干净
-RENDER_AT = 512
+RENDER_AT = 1024
 
 
 def mark() -> str:

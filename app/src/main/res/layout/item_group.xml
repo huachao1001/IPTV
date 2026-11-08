@@ -1,11 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- 分组导航项：尺寸在 GroupAdapter 里按屏幕等比换算 -->
+<!-- focusableInTouchMode 同 item_channel.xml：点过屏幕后仍要能用方向键选分组 -->
 <TextView xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/groupName"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:background="@drawable/group_bg"
     android:focusable="true"
+    android:focusableInTouchMode="true"
     android:gravity="center_vertical"
     android:paddingStart="18dp"
     android:paddingTop="14dp"

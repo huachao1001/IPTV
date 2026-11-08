@@ -1,4 +1,4 @@
-package com.iptv.live;
+package com.iptv.live.source;
 
 import android.app.AlarmManager;
 import android.app.PendingIntent;
@@ -6,6 +6,7 @@ import android.content.Context;
 import android.content.Intent;
 
 import java.util.Calendar;
+import com.iptv.live.RefreshReceiver;
 
 /** 每日定时刷新：每天凌晨固定时间拉一次，失败保留旧数据。 */
 public final class DailyRefresh {

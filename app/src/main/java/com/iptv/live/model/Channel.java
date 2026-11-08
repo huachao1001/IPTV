@@ -1,4 +1,4 @@
-package com.iptv.live;
+package com.iptv.live.model;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -13,7 +13,7 @@ public class Channel {
         /**
          * 节目单声明的清晰度（如 {@code [1080]} 标签），购选源/排序/清晰度上限都用它。
          *
-         * <p><b>它必须稳定。</b>一旦被实测值改写，{@link QualityCap} 依据的档位
+         * <p><b>它必须稳定。</b>一旦被实测值改写，{@code QualityCap} 依据的档位
          * 就跟着漂移，降档的「上限」会失效或误判，表现为画面来回切。
          * 所以实测结果只写 {@link #measured}，不碰这个字段。
          */
@@ -159,7 +159,7 @@ public class Channel {
         });
     }
 
-    static int rank(String q) {
+    public static int rank(String q) {
         if (q == null || q.isEmpty()) {
             return 0;
         }
@@ -174,7 +174,7 @@ public class Channel {
     }
 
     /** 从 tvg-name 的标记（如 CCTV1[1080][S]）里取清晰度。 */
-    static String qualityOf(String tag) {
+    public static String qualityOf(String tag) {
         if (tag == null) {
             return null;
         }

@@ -1,4 +1,7 @@
-package com.iptv.live;
+package com.iptv.live.source;
+
+import com.iptv.live.model.Channel;
+import com.iptv.live.play.TsAudio;
 
 import android.content.Context;
 import android.content.SharedPreferences;

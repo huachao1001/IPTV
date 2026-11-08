@@ -1,4 +1,4 @@
-package com.iptv.live;
+package com.iptv.live.play;
 
 /**
  * 静默卡死判定：播放器状态上「在播」(READY + playWhenReady、不缓冲、无错误)，
@@ -32,7 +32,7 @@ package com.iptv.live;
  *
  * <p>纯逻辑类：采样由调用方驱动（传入当前时间与帧数），便于单测注入时钟。
  */
-final class StallDetector {
+public final class StallDetector {
 
     /**
      * 位置停滞多久判定为卡死。
@@ -85,7 +85,7 @@ final class StallDetector {
      * @param now      当前时间（{@link System#currentTimeMillis()} 或 uptime，由调用方统一）
      * @return true 表示判定为卡死（调用方应重连）；触发后内部计时自动重置，避免连环触发
      */
-    boolean sample(boolean eligible, long position, long now) {
+    public boolean sample(boolean eligible, long position, long now) {
         return sample(eligible, position, -1L, now);
     }
 
@@ -98,7 +98,7 @@ final class StallDetector {
      * @param now       当前时间（调用方统一时钟）
      * @return true 表示判定为卡死
      */
-    boolean sample(boolean eligible, long position, long frames, long now) {
+    public boolean sample(boolean eligible, long position, long frames, long now) {
         if (!eligible) {
             // 暂停/缓冲/错误/未起播：这些状态下不动是正常的，重置基线不计时
             lastPos = position;
@@ -152,12 +152,12 @@ final class StallDetector {
     }
 
     /** 最近一次触发时的停滞时长（位置口径）。比 {@link #stalledForMs} 可靠，后者触发后已清零。 */
-    long lastTriggerPosMs() {
+    public long lastTriggerPosMs() {
         return triggerPosMs;
     }
 
     /** 最近一次触发时的画面停滞时长。 */
-    long lastTriggerFrameMs() {
+    public long lastTriggerFrameMs() {
         return triggerFrameMs;
     }
 
@@ -167,7 +167,7 @@ final class StallDetector {
     }
 
     /** 切台/重连/重建播放器后调用：清空基线，新会话重新计时。 */
-    void reset() {
+    public void reset() {
         lastPos = Long.MIN_VALUE;
         lastAdvanceAt = 0L;
         lastFrames = -1L;

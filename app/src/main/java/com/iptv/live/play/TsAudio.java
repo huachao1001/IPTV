@@ -1,4 +1,4 @@
-package com.iptv.live;
+package com.iptv.live.play;
 
 /**
  * 从 TS 分片里识别音轨和视频编码。
@@ -7,10 +7,10 @@ package com.iptv.live;
  * MP2 频道只能出画面没声音（强行给 MP3 解码器还会崩），
  * mpeg2video 频道要软解而且常是机房的纯色占位画面。
  */
-final class TsAudio {
+public final class TsAudio {
 
     /** 音轨编码。 */
-    enum Kind {
+    public enum Kind {
         /** 尚未识别。 */
         UNKNOWN,
         /** AAC（ADTS 或 LATM），本机能解。 */
@@ -22,7 +22,7 @@ final class TsAudio {
     }
 
     /** 视频编码。 */
-    enum Video {
+    public enum Video {
         UNKNOWN,
         H264,
         HEVC,
@@ -38,7 +38,7 @@ final class TsAudio {
     }
 
     /** 扫描一段 TS 数据里的音轨编码，识别不出返回 UNKNOWN。 */
-    static Kind detect(byte[] data, int length) {
+    public static Kind detect(byte[] data, int length) {
         int pmt = findPmt(data, length);
         if (pmt < 0) {
             return Kind.UNKNOWN;
@@ -61,7 +61,7 @@ final class TsAudio {
     }
 
     /** 扫描一段 TS 数据里的视频编码，识别不出返回 UNKNOWN。 */
-    static Video detectVideo(byte[] data, int length) {
+    public static Video detectVideo(byte[] data, int length) {
         int pmt = findPmt(data, length);
         if (pmt < 0) {
             return Video.UNKNOWN;
