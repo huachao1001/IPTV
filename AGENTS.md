@@ -722,6 +722,159 @@ ensurePlayingGroup();
 `group_bg.xml` / `group_text.xml`：10dp 圆角、焦点实心蓝、选中淡蓝 + 描边）。
 档位少时 `wrap_content` 紧贴内容，档位多时 `ScrollView` 限高到屏幕 72% 自己滚。
 
+### 缓冲圈为什么一直闪（本轮定位，两条独立病根）
+
+用户原话："缓冲旋转进度一直闪，要自动检测，不能一直闪；如果是缓存时间短导致的，
+要自动调整参数"。查下来是**两个独立的 bug 叠在一起**，都必须修。
+
+#### 病根一：`shouldContinueLoading` 照抄了点播公式
+
+`DefaultLoadControl` 的判据是 `buffered < min || (buffered < max && speed > 1)`。
+1 倍速下**攒到 `min` 就停手**——对点播没问题（数据一直在那儿），
+对直播是陷阱：停手时手里的余量正好是最薄的那一档，下个分片稍慢就播空、
+进一次 BUFFERING，再攒到 min 再播空。
+
+真机实测序列（`build/` 日志）：
+
+```
+16:53:42  buffered=9769
+16:53:44  buffered=7756
+16:53:48  buffered=3761
+16:53:50  buffered=1751
+16:53:52  buffered=102   ← 播空，进 BUFFERING
+16:53:58  buffered=9683  ← 重开后排到直播边缘，跳到 9.7 秒
+```
+
+**周期 16 秒**，和「5 秒分片 × 3」完全对得上。
+
+改成"一直吃到 `max` 为止"：`return bufferedMs < maxBufferMs();`
+直播的数据量天然有上限（到直播边缘就没有了），不会像点播那样把整部片子拖下来。
+实测缓冲深度上限从 9.7 秒涨到 **14.7 秒**，播空次数显著下降。
+
+#### 病根二：`max` 被写成大于 `offset`（攒不满的墙）
+
+直播能缓冲多深，**完全由"播放位置落后直播多少"决定**——数据到直播边缘就没了。
+第一版档位表把 `max` 写成 14000 而 `offset` 只有 10000，
+等于把上限设在够不着的墙上，播放器会一直请求、永远攒不满。
+
+档位表现在刻意**去掉了「最小缓冲」这一列**（改成一吃到底后它不参与任何判断，
+留一个不生效的列只会误导后人），只保留 `{gate, rebuf, max, offset}`：
+
+| 档 | gate | rebuf | max | offset |
+|----|------|-------|-----|--------|
+| 0 | 4500 | 5500 | 12000 | 14000 |
+| 1 | 5000 | 6000 | 14000 | 16000 |
+| 2 | 5500 | 6500 | 15000 | 17000 |
+| 3 | 6000 | 7000 | 15500 | 18000 |
+| 4 | 7000 | 8000 | 16000 | 18000 |
+
+**三条硬约束，改数字前必须逐行核对**：`max < offset`、`offset` 明显小于
+直播窗口（实测 5 片 × 5 秒 = 25 秒，上限取 18 秒留 7 秒富余）、`gate <= max`。
+
+第 0 档 `offset` 从 10 秒放宽到 14 秒：分片 5 秒一个，只落后 10 秒时手里
+最多攥住一片多一点；14 秒能稳稳装下两个整片。**起播速度不受影响**——
+`shouldStartPlayback` 只看起播门槛（4.5 秒），不看 offset。
+
+#### 病根三：`onStreamChanged()` 把卡顿计数也清了
+
+第一次跑出来每次都是 `rebuffer hits=1/2`，档位一次都升不上去。
+原因是看门狗重开同一条线路会走 `resetStreamState()` → `onStreamChanged()`，
+那里把 `hits` 一起清了。但**同一条地址被重开本身就是"喂不动"的证据**，
+当成全新一轮等于永远攒不到 `ESCALATE_HITS`。
+
+现在 `onStreamChanged()` **只清 `stableSince`，绝不碰 `hits`**。
+档位是「这台机器 + 这条网络」的结论，不是某个频道的结论，跨台带过来才对。
+
+#### 升档必须有三道闸（否则 30 秒升到满档）
+
+修好上面三条后立刻暴露新问题：**模拟器坏网络下 30 秒内连升 4 档**，
+延迟被推到 18 秒、起播门槛涨到 7 秒。三道闸缺一不可：
+
+| 闸 | 常量 | 作用 |
+|----|------|------|
+| 最短卡顿时长 | `MIN_FLASH_MS = 1000` | 分片边界几十毫秒的空档在坏网络上每秒都有，全算进来会把档位瞬间推满 |
+| 同一次抖动去重 | `HIT_DEDUPE_MS = 15000` | 一次卡顿会多次进出 BUFFERING，不去重会按 2~3 倍计 |
+| 升档冷却 | `RAISE_COOLDOWN_MS = 120000` | 加厚一层要观察一段时间才知道够不够，连着升毫无信息量 |
+
+**卡顿时长从 STATE_READY 里算**：进入 BUFFERING 时记 `rebufferStart`，
+回到 READY 时算 `now - rebufferStart` 传给 `onRebuffer(stalledMs)`。
+顺手把满档告警限频到 30 秒一次（`MAX_LOG_INTERVAL_MS`），否则日志被淹。
+
+#### 缓冲圈的显示：短暂缓冲一个像素都不画
+
+`BufferingUi`（`ui/` 包）专门管这件事，规则三条：
+
+1. **起播立刻显示**——屏幕是黑的，不给反馈用户以为按了没反应；
+2. **出过画面之后进缓冲，先等 `SHOW_DELAY_MS = 1200`**。
+   正常分片边界的空档在 400 毫秒以内，追直播的微调也在 1 秒以内，
+   真的"喂不动"必然是数秒级。1.2 秒把所有正常抖动挡在门外；
+3. **进度分母跟着档位走**（`governor.playGateMs()` / `rebufferGateMs()`），
+   封顶 98%——真攒够了播放器会立刻转 READY、转圈直接消失；
+   显示 100% 却还停在缓冲，用户看到的是一个静止的满环，反而像卡死。
+
+日志 `IPTVBUBBLE` 三行就是全部证据：
+
+```
+show first-play          ← 起播，立刻转圈
+suppressed short bubble   ← 短暂缓冲被延迟窗口挡掉，压根没画（不再闪的直接证据）
+show after 1200ms         ← 真卡住了才显示
+```
+
+`reset()` / `showNow()` / `hide()` 三个入口分别对应：换台、用户手选清晰度
+（明确要求等待）、播放失败或放弃。
+
+### 预取：按 OK / 焦点移动就把相邻频道抓进缓存
+
+用户原话："要提前缓存，比如用户按 OK，就要预判用户可能上下切换，
+提前预判做缓存"。`PlaybackCache`（`play/` 包）做两件事：
+
+#### 1. 磁盘缓存，消除重复下载
+
+`SimpleCache` + `LeastRecentlyUsedCacheEvictor(256MB)`，目录 `cacheDir/media`。
+换台来回切、播放器抖动重开同一条线路时，分片直接从磁盘读。
+
+**整个进程只能建一个 `SimpleCache`**：同一目录被打开两次会直接抛
+`IllegalStateException: Another SimpleCache instance uses the folder`。
+所以做成静态单例。初始化失败（上次进程被杀在写入中间）时删掉重建一次，
+仍失败就退化为无缓存直连——**缓存坏了绝不能连累播放**。
+
+接入点在 `PlaybackTuning.create()`：`setMediaSourceFactory(new
+DefaultMediaSourceFactory(PlaybackCache.factory(ctx)))`。
+`DefaultHttpDataSource` 那套超时/UA 参数搬进了 `PlaybackCache.factory()`，
+**不要再在 `PlaybackTuning` 里另建一份**，两处各写一套迟早不一致。
+
+#### 2. 预取"起播那几秒"，不是整条流
+
+直播流是无限的，抓整条会占满带宽和磁盘，反而把正在播的那一路拖卡。
+只取**播放列表 + 前 `PREFETCH_SEGMENTS = 3` 个分片**。
+
+调用时机就是用户意图最明显的两个时刻：
+
+| 时机 | 位置 | 候选顺序 |
+|------|------|----------|
+| 按 OK 打开菜单（几乎一定是要换台） | `openMenu()` | 焦点行 → ±1 → ±2 |
+| 列表里上下移动焦点 | `moveChannelFocusTo()` | 同上 |
+
+每个台只取它当前最可能用的那条线路（`quickestSource()`），
+不去预取一堆确定不会用的备胎。
+
+**预取必须能立刻取消**（`cancelPrefetch()`）。用户浏览得快时候选一直在变，
+不取消的话几十个请求同时排队、抢占当前播放带宽，正好造成"越预取越卡"。
+取消点：`closeMenu()`（放弃换台）、`play()`（这一路真要播了）、`onDestroy()`。
+
+预取并发固定 2 线程（`PREFETCH_THREADS`），最多同时 3 路（`PREFETCH_MAX`）。
+
+日志：`IPTVCACHE cache ready dir=... limit=256MB`、
+`IPTVCACHE prefetch ok segs=3 <url>`、`IPTVCACHE prefetch skip <url> -> <异常>`。
+
+#### 坑：`android.net.Uri` 没有 `resolve`
+
+补相对地址只能自己按最后一个 `/` 算，顺便处理 `//host/path` 和 `?query`。
+
+#### 坑：`CacheDataSource.close()` 抛 IOException
+
+`finally` 里裸调 `source.close()` 编译不过，必须包 try/catch。
+
 ---
 
 ## 三、待办

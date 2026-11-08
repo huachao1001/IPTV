@@ -215,6 +215,10 @@ public final class SourceProber {
         // 但不会因为某个 576 线路恰好突发速率高就被顶掉。
         int playingRank = ch.sources.get(playing).effectiveRank();
         final int floor = Math.max(0, playingRank);
+        // 可信度闸门：精修只允许换成"不比当前更不可信"的线路。
+        // 与 floor 同理——当前线路若是清单里带代号确认过的，
+        // 一条跑得更快但名字标错的线路不该把它顶掉。
+        final int playingTrust = ch.sources.get(playing).trust;
 
         CompletionService<Result> results = new ExecutorCompletionService<>(POOL);
         List<Future<Result>> probing = new ArrayList<>();
@@ -226,6 +230,9 @@ public final class SourceProber {
             }
             int r = ch.sources.get(i).effectiveRank();
             if (r > cap || r < floor) {
+                continue;
+            }
+            if (ch.sources.get(i).trust < playingTrust) {
                 continue;
             }
             final int idx = i;
@@ -304,11 +311,30 @@ public final class SourceProber {
         // 都走这里，不可能越权升档。
         final int cap = QualityCap.capRank(ctx, ch.name);
 
+        // 可信度优先：只在"最高可信度"的线路里选。
+        //
+        // 探测只量得出快不快，量不出"这是不是那个台"。清单里确实有错标
+        // （实测选「山东卫视」播英超、选「广东卫视」播 CCTV-11），
+        // 一条标错的高码率线路往往比正确线路更快，不设这道闸就会被它抢走。
+        //
+        // 最高可信度那批全都探不通时，允许降到下一档再试（见下面的重试）。
+        int bestTrust = -1;
+        for (int i = 0; i < n; i++) {
+            Channel.Source s = ch.sources.get(i);
+            if (i == exclude || Boolean.TRUE.equals(s.starved) || s.effectiveRank() > cap) {
+                continue;
+            }
+            if (s.trust > bestTrust) {
+                bestTrust = s.trust;
+            }
+        }
+
         // 候选少的时候没有备胎，每路都探久一点，读数更接近真实持续速率
         int alive = 0;
         for (int i = 0; i < n; i++) {
-            if (i != exclude && !Boolean.TRUE.equals(ch.sources.get(i).starved)
-                    && ch.sources.get(i).effectiveRank() <= cap) {
+            Channel.Source s = ch.sources.get(i);
+            if (i != exclude && !Boolean.TRUE.equals(s.starved)
+                    && s.effectiveRank() <= cap && s.trust == bestTrust) {
                 alive++;
             }
         }
@@ -328,6 +354,10 @@ public final class SourceProber {
             }
             // 超过清晰度上限的线路不探：探了也不会选，白花时间
             if (ch.sources.get(i).effectiveRank() > cap) {
+                continue;
+            }
+            // 低可信度的线路留到"高可信度全都不行"时再探
+            if (ch.sources.get(i).trust != bestTrust) {
                 continue;
             }
             final int idx = i;

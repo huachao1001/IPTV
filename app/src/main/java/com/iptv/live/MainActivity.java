@@ -36,6 +36,7 @@ import androidx.recyclerview.widget.RecyclerView;
 
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -46,8 +47,10 @@ import java.util.Set;
 
 import com.iptv.live.model.Channel;
 import com.iptv.live.model.ChannelGroups;
+import com.iptv.live.play.BufferGovernor;
 import com.iptv.live.play.LiveSpeedMeter;
 import com.iptv.live.play.LoadSpeedMeter;
+import com.iptv.live.play.PlaybackCache;
 import com.iptv.live.play.PlaybackTuning;
 import com.iptv.live.play.StallDetector;
 import com.iptv.live.source.ChannelStore;
@@ -55,9 +58,11 @@ import com.iptv.live.source.DailyRefresh;
 import com.iptv.live.source.DeadSources;
 import com.iptv.live.source.QualityCap;
 import com.iptv.live.source.QualityMemory;
+import com.iptv.live.source.SourceHealth;
 import com.iptv.live.source.SourceMemory;
 import com.iptv.live.source.SourceProber;
 import com.iptv.live.ui.BufferingIndicator;
+import com.iptv.live.ui.BufferingUi;
 import com.iptv.live.ui.ChannelAdapter;
 import com.iptv.live.ui.CenteringLayoutManager;
 import com.iptv.live.ui.GroupAdapter;
@@ -96,8 +101,6 @@ public class MainActivity extends Activity {
      * 足够放下四个字加左右呼吸空间，同时把画面让出来。
      */
     private static final int RIGHT_PANEL_PCT = 16;
-    /** 缓冲区攒到这个时长即视为可以起播，环形进度以此为 100%。 */
-    private static final long BUFFER_TARGET_MS = 10_000;
     /** 收藏分组在导航栏的位置。 */
     private static final String FAVORITES = "收藏";
     /**
@@ -111,6 +114,8 @@ public class MainActivity extends Activity {
     private ExoPlayer player;
     private PlayerView playerView;
     private BufferingIndicator loading;
+    /** 缓冲指示器的开关管家：短暂缓冲不显示，只有真的卡住才转圈。 */
+    private BufferingUi bufferUi;
     private RecyclerView list;
     /** 频道列表的布局管理器：负责把当前行滚到垂直正中。 */
     private CenteringLayoutManager listManager;
@@ -327,40 +332,20 @@ public class MainActivity extends Activity {
     private final Runnable hideHint = () -> hint.setVisibility(View.GONE);
 
 
-    /**
-     * 缓冲期间刷新环形进度。
-     * 以"攒够起播所需的缓冲"为 100%，用户能直接看出还要等多久。
+    /** 缓冲态入口：显示时机、进度分母都由 {@link BufferingUi} 与
+     * {@link BufferGovernor} 决定——短暂缓冲不该弹转圈（那正是
+     * "缓冲圈一直闪"的来源），进度以当前档位的起播门槛为 100%。
      */
-    private final Runnable bufferProgress = new Runnable() {
-        @Override
-        public void run() {
-            if (player == null || player.getPlaybackState() != Player.STATE_BUFFERING) {
-                return;
-            }
-            loading.setProgress(player.getTotalBufferedDuration() / (float) BUFFER_TARGET_MS);
-            loading.setSpeedText(speedText());
-            ui.postDelayed(this, 200);
-        }
-    };
-
     private void startBufferProgress() {
-        ui.removeCallbacks(bufferProgress);
-        loading.setProgress(-1f);
-        ui.post(bufferProgress);
-    }
-
-    /** 缓冲环下方的文案：有实测速率就显示速率，刚开始连流时给一句可读的状态。 */
-    private String speedText() {
-        LiveSpeedMeter m = LiveSpeedMeter.INSTANCE;
-        long bps = m.bytesPerSecond();
-        if (bps > 0) {
-            return LoadSpeedMeter.format(bps);
+        if (bufferUi != null) {
+            bufferUi.onBuffering(!hasPlayed);
         }
-        return m.hasSample() ? "0 KB/s" : "连接中";
     }
 
     private void stopBufferProgress() {
-        ui.removeCallbacks(bufferProgress);
+        if (bufferUi != null) {
+            bufferUi.onReady();
+        }
     }
 
     /**
@@ -465,6 +450,14 @@ public class MainActivity extends Activity {
                 if (stallDetector.sample(eligible, p.getCurrentPosition(), frames, now)) {
                     onSilentStall(p);
                 }
+                // 播得稳稳的，顺便让缓冲管家记账：连续稳定够久才收回一档，
+                // 把延迟调回来。每秒一次足够——它内部按分钟级别判断。
+                if (eligible) {
+                    BufferGovernor g = PlaybackTuning.governor();
+                    if (g != null) {
+                        g.onStablePlayback();
+                    }
+                }
             }
             ui.postDelayed(this, SILENT_STALL_TICK_MS);
         }
@@ -505,7 +498,7 @@ public class MainActivity extends Activity {
             // 这个台的线路怎么重开都卡，别再耗着，把状态清干净等用户换台
             android.util.Log.w("IPTVSTALL", "silent-stall give up ch=" + c.name);
             silentStallRounds = 0;
-            loading.setVisibility(View.GONE);
+            bufferUi.hide();
             showHint("该频道播放异常，请换个台");
             return;
         }
@@ -599,7 +592,7 @@ public class MainActivity extends Activity {
                 android.util.Log.w("IPTVSTALL", "give up ch=" + c.name
                         + " after " + startupFailures + " tries");
                 startupFailures = 0;
-                loading.setVisibility(View.GONE);
+                bufferUi.hide();
                 ui.removeCallbacks(startupWatchdog);
                 showHint("该频道暂时无法播放，请换个台");
                 return;
@@ -1010,7 +1003,9 @@ public class MainActivity extends Activity {
                 @Override
                 public void onPlaybackStateChanged(int state) {
                     if (state == Player.STATE_BUFFERING) {
-                        loading.setVisibility(View.VISIBLE);
+                        // 显示时机交给 BufferingUi：起播立刻转圈，出过画面之后
+                        // 要卡满 1.2 秒才显示。原来这里无条件 VISIBLE，
+                        // 分片边界的零点几秒空档也会弹一下 → 缓冲圈一直闪。
                         startBufferProgress();
                         // 起播时的缓冲是正常的，只有播起来以后又卡才算卡顿
                         if (hasPlayed) {
@@ -1022,8 +1017,18 @@ public class MainActivity extends Activity {
                             noteRebuffer();
                         }
                     } else if (state == Player.STATE_READY) {
+                        // 这一轮缓冲到底持续了多久：缓冲管家要靠它区分
+                        // "分片边界的几十毫秒空档"和"真的喂不动"。
+                        // 前者在坏网络下每秒都有，全算进去会把档位瞬间推满。
+                        long stalledMs = rebufferStart > 0
+                                ? System.currentTimeMillis() - rebufferStart : 0L;
+                        if (hasPlayed && stalledMs > 0) {
+                            BufferGovernor g = PlaybackTuning.governor();
+                            if (g != null) {
+                                g.onRebuffer(stalledMs);
+                            }
+                        }
                         stopBufferProgress();
-                        loading.setVisibility(View.GONE);
                         hasPlayed = true;
                         retryRound = 0;
                         ui.removeCallbacks(stallWatchdog);
@@ -1036,6 +1041,10 @@ public class MainActivity extends Activity {
                             // 能播起来就说明它不是死源：撤销之前可能留下的黑名单，
                             // 免得一次误判（比如临时断网）把它永久剔掉
                             DeadSources.revive(MainActivity.this, c.url(sourceIndex));
+                            // 同时记一笔"这条线路真的出过画面"。
+                            // 这是「滚雪球」刷新唯一的存活证据：旧线路默认保留，
+                            // 只有既不在新清单里、又很久没播成功过才会被淘汰。
+                            SourceHealth.markGood(MainActivity.this, c.url(sourceIndex));
                         }
                     }
                 }
@@ -1065,6 +1074,13 @@ public class MainActivity extends Activity {
                 }
             });
         }
+
+        // 缓冲指示器的开关交给专门的管家：短暂缓冲不显示，只有真的卡住才转圈
+        bufferUi = new BufferingUi(loading, PlaybackTuning.governor());
+        bufferUi.setPlayerSource(() -> {
+            ExoPlayer p = player;
+            return p == null ? -1L : p.getTotalBufferedDuration();
+        });
 
         store = new ChannelStore(this);
         DailyRefresh.schedule(this);
@@ -1143,15 +1159,18 @@ public class MainActivity extends Activity {
         UiScale.padding(hint, 26, 12, 26, 12);
         UiScale.margin(hint, 0, 0, 0, 18);
 
-        // 左上角台标：和台名同排，高一点但不能盖过顶栏。
-        // 台标本身已归一化成 2:1，按 2:1 给框才能完整不变形地放下。
-        int logoH = UiScale.pxH(38);
+        // 左上角台标：和台名同排。
+        // 台标图片本身已归一化成 2:1，按 2:1 给框才能完整不变形地放下。
+        // 尺寸按用户要求放大到原 38（1080p 基准）的 2.5 倍。
+        // 顶栏是 wrap_content + center_vertical，台标变高后自动把顶栏撑起来，
+        // 不需要单独改 topBar 的 padding，否则上下留白会重复叠加。
+        int logoH = UiScale.pxH(95);
         int logoW = logoH * 2;
         ViewGroup.LayoutParams logoLp = infoLogo.getLayoutParams();
         logoLp.width = logoW;
         logoLp.height = logoH;
         infoLogo.setLayoutParams(logoLp);
-        UiScale.margin(infoLogo, 0, 0, 14, 0);
+        UiScale.margin(infoLogo, 0, 0, 18, 0);
 
         // 右侧清晰度面板：宽度按规则 4 收窄到 RIGHT_PANEL_PCT，
         // 高度铺满整屏（用户要求：面板背景上下对齐屏幕上下）。
@@ -1568,7 +1587,15 @@ public class MainActivity extends Activity {
         showBar();
         getPreferences(MODE_PRIVATE).edit().putInt("current", index).apply();
 
-        loading.setVisibility(View.VISIBLE);
+        // 换台是全新一轮：缓冲指示器重置为"还没出画面"，
+        // 下一次 STATE_BUFFERING 会立刻转圈（屏幕是黑的，必须给反馈）
+        if (bufferUi != null) {
+            bufferUi.reset();
+            bufferUi.showNow();
+        }
+        // 这一路现在真的要播了，之前为"别的候选"跑着的预取必须停：
+        // 它们会和这一路抢带宽，正好造成"越预取越卡"
+        PlaybackCache.cancelPrefetch();
         // 换台后重新统计网速，避免显示上一条流的读数
         speed.reset();
         LiveSpeedMeter.INSTANCE.reset();
@@ -1630,7 +1657,7 @@ public class MainActivity extends Activity {
                     play(index);
                     return;
                 }
-                loading.setVisibility(View.GONE);
+                bufferUi.hide();
                 return;
             }
             sourceIndex = picked;
@@ -1654,17 +1681,36 @@ public class MainActivity extends Activity {
      */
     private int quickestSource(Channel c) {
         int cap = QualityCap.capRank(this, c.name);
+        // 先按可信度挑一档：只用"最高可信度"里清晰度最高的那一批。
+        //
+        // 这一步不能省。清单里确实有错标（实测选「山东卫视」播英超、
+        // 选「广东卫视」播 CCTV-11），而带台名代号的线路是清单自身的
+        // 正向证据。若这里仍单纯按档位选最大，就会越过排序结果
+        // 去选一条"档位最高但名字错"的线路，assignTrust 白做。
+        int bestTrust = -1;
+        for (Channel.Source s : c.sources) {
+            if (Boolean.TRUE.equals(s.starved) || s.effectiveRank() > cap) {
+                continue;
+            }
+            if (s.trust > bestTrust) {
+                bestTrust = s.trust;
+            }
+        }
+        if (bestTrust < 0) {
+            return -1;
+        }
         int best = -1;
         int bestRank = -1;
         for (int i = 0; i < c.sources.size(); i++) {
-            if (Boolean.TRUE.equals(c.sources.get(i).starved)) {
+            Channel.Source s = c.sources.get(i);
+            if (Boolean.TRUE.equals(s.starved) || s.trust != bestTrust) {
                 continue;
             }
-            int r = c.sources.get(i).effectiveRank();
+            int r = s.effectiveRank();
             if (r > cap) {
                 continue;
             }
-            // sources 已按（清晰度降序, response-time 升序）排过，
+            // sources 已按（可信度, 清晰度, 实测, response-time）排过，
             // 所以第一个最高档的就是同档里最快的
             if (r > bestRank) {
                 bestRank = r;
@@ -1753,7 +1799,9 @@ public class MainActivity extends Activity {
     /** 真正起播：此时源已确认可达。预览模式下只刷新界面。 */
     private void startPlayback(Channel c) {
         if (player == null) {
-            loading.setVisibility(View.GONE);
+            if (bufferUi != null) {
+                bufferUi.hide();
+            }
             renderTopLogo(c);
             return;
         }
@@ -1807,10 +1855,14 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * 右侧清晰度面板：每档一行，选中态高亮，点即切到该档的线路。
+     * 右侧清晰度面板：每个分辨率一行，全部展示，不折叠。
      *
-     * <p>去重规则和原来的胶囊一致：已知分辨率按 {@code displayKey()} 去重，
-     * 还没测出分辨率的线路折叠成一行"更多线路"，避免十条未知源把面板撑爆。
+     * <p>去重只按<b>分辨率本身</b>：{@code 1080P} 有 8 条线路也只占一行，
+     * 点了就切到该档的最优线路。多档就多行，不再有"更多线路"这种
+     * 把一堆未知源塞进同一个入口的选项——用户要的是"点哪个分辨率就是哪个"。
+     *
+     * <p>节目单没给标记、也还没测出分辨率的线路归为最后一行「自动」：
+     * 它同样是一个明确的档位含义（让程序自己挑），而不是"更多"。
      */
     private void renderQualityPanel(Channel c) {
         if (qualityRow == null) {
@@ -1824,29 +1876,37 @@ public class MainActivity extends Activity {
         qualityRow.removeAllViews();
         String currentLabel = c.source(sourceIndex).displayKey();
 
-        Set<String> used = new LinkedHashSet<>();
+        // 每档只保留一个代表线路：先出现的那条（sources 已按可信度/速度排好）。
+        // 用 LinkedHashMap 记住"档位 -> 代表线路下标"，顺便保住首次出现次序。
+        Map<String, Integer> best = new LinkedHashMap<>();
         int firstUnknown = -1;
-        int unknownCount = 0;
         for (int i = 0; i < c.sources.size(); i++) {
-            Channel.Source s = c.sources.get(i);
-            String key = s.displayKey();
+            String key = c.sources.get(i).displayKey();
             if (key.isEmpty()) {
                 if (firstUnknown < 0) {
                     firstUnknown = i;
                 }
-                unknownCount++;
                 continue;
             }
-            if (!used.add(key)) {
-                continue;
+            if (!best.containsKey(key)) {
+                best.put(key, i);
             }
-            addQualityRowItem(key, i, key.equals(currentLabel));
+        }
+        // 面板是"选分辨率"，顺序必须按<b>分辨率高低</b>，不能沿用线路排序。
+        //
+        // sources 的顺序是「可信度优先」——为了让名字正确的线路先播，
+        // 一条可信的 720P 会排在一条无代号的 1080P 前面。把这个顺序照搬到面板上，
+        // 用户看到的就是 720P / 1080P / 576P 这种乱序（实测确实如此），
+        // 而选分辨率的菜单应该一眼看出哪档最高。
+        List<String> keys = new ArrayList<>(best.keySet());
+        Collections.sort(keys, (a, b) -> Channel.rank(b) - Channel.rank(a));
+        for (String key : keys) {
+            addQualityRowItem(key, best.get(key), key.equals(currentLabel));
         }
         boolean onUnknown = c.source(sourceIndex).displayKey().isEmpty();
         if (firstUnknown >= 0) {
             int target = onUnknown ? nextUnknown(c, sourceIndex) : firstUnknown;
-            addQualityRowItem("更多线路" + (unknownCount > 1 ? " " + unknownCount : ""),
-                    target, onUnknown);
+            addQualityRowItem(UNKNOWN_ROW_LABEL, target, onUnknown);
         }
         // 面板开着时重建了视图（用户刚选了另一档），焦点会随旧视图一起没掉，
         // 不补回来的话上面板立刻"失灵"，还得再按一次右键。
@@ -1863,7 +1923,16 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** 找下一个清晰度未知的线路，用来在"更多线路"上循环。 */
+    /**
+     * 未标档线路那一行的文字。
+     *
+     * <p>刻意<b>不</b>叫"更多线路"：面板是"选分辨率"的地方，
+     * 塞一个"更多"进去等于把一堆未知源藏在一个选项后面，
+     * 用户点它并不知道会播成什么。这里只声明"这档交给程序自动挑"。
+     */
+    private static final String UNKNOWN_ROW_LABEL = "自动";
+
+    /** 找下一个清晰度未知的线路，用来在"自动"这一档上循环。 */
     private static int nextUnknown(Channel c, int from) {
         for (int k = 1; k <= c.sources.size(); k++) {
             int i = (from + k) % c.sources.size();
@@ -2144,7 +2213,11 @@ public class MainActivity extends Activity {
         android.util.Log.i("IPTVQUAL", "manual-pick ch=" + c.name
                 + " -> " + c.source(index).label()
                 + " grace=" + (MANUAL_PICK_GRACE_MS / 1000) + "s");
-        loading.setVisibility(View.VISIBLE);
+        // 用户主动点了清晰度：这是他明确要求的等待，立刻显示转圈
+        if (bufferUi != null) {
+            bufferUi.reset();
+            bufferUi.showNow();
+        }
         speed.reset();
         LiveSpeedMeter.INSTANCE.reset();
         // 重新渲染信息条让选中态跟上用户的选择
@@ -2158,7 +2231,9 @@ public class MainActivity extends Activity {
      * 静默重试即可，绝不把用户留在永久黑屏里。
      */
     private void onSourceFailed(PlaybackException error) {
-        loading.setVisibility(View.GONE);
+        if (bufferUi != null) {
+            bufferUi.hide();
+        }
         ui.removeCallbacks(recoverPlayback);
         ui.postDelayed(recoverPlayback, 400);
     }
@@ -2281,7 +2356,10 @@ public class MainActivity extends Activity {
         final String chName = c.name;
         // 失败线路不能再当"记忆线路"，否则下次换台还会先踩一次坑
         SourceMemory.remove(this, c.name);
-        loading.setVisibility(View.VISIBLE);
+        if (bufferUi != null) {
+            bufferUi.reset();
+            bufferUi.showNow();
+        }
         speed.reset();
         LiveSpeedMeter.INSTANCE.reset();
         SourceProber.pickExcluding(this, c, -1, failed, picked -> {
@@ -2291,7 +2369,9 @@ public class MainActivity extends Activity {
             }
             if (picked < 0) {
                 // 全部线路都不可用，留在原地等它自己恢复
-                loading.setVisibility(View.GONE);
+                if (bufferUi != null) {
+                    bufferUi.hide();
+                }
                 return;
             }
             sourceIndex = picked;
@@ -2578,6 +2658,11 @@ public class MainActivity extends Activity {
         // 用户看到的就是"按 OK 后方向键压根没法切换"。
         // 触摸模式下仍需落焦，只是改用 requestFocusFromTouch() 绕开限制。
         focusDrawerList(0);
+
+        // 用户按下 OK 打开菜单，几乎一定是要换台。趁他还在看列表，
+        // 先把当前台和相邻几台的"起播几秒"抓到磁盘里，
+        // 真正按下去时首帧几乎是瞬时的。
+        prefetchAround(current >= 0 ? current : 0);
     }
 
     /** 收起整个菜单：三块一起走，不留半套 UI（规则 1）。 */
@@ -2588,6 +2673,9 @@ public class MainActivity extends Activity {
             VirtualRemote.setReservedRight(0);
             return;
         }
+        // 菜单收起了：用户要么选了台、要么放弃换台。预取的候选已经不作数，
+        // 继续下载只会和正在播的那一路抢带宽（正好造成"越预取越卡"）。
+        PlaybackCache.cancelPrefetch();
         drawer.setVisibility(View.GONE);
         qualityPanel.setVisibility(View.GONE);
         VirtualRemote.setReservedRight(0);
@@ -2924,6 +3012,9 @@ public class MainActivity extends Activity {
             return;
         }
         lastFocusPos = position;
+        // 焦点落在哪一行，用户下一步最可能看的就是它（或者它上下相邻的台）。
+        // 提前把这几路的"起播几秒"抓进磁盘缓存，真按下去时首帧几乎是瞬时的。
+        prefetchAround(position);
         ui.post(() -> {
             View row = listManager == null ? null : listManager.findViewByPosition(position);
             if (row == null) {
@@ -2948,6 +3039,57 @@ public class MainActivity extends Activity {
             }
             ui.postDelayed(() -> smoothScrollPending = false, 300);
         });
+    }
+
+    /**
+     * 把焦点所在行及其相邻几行的"起播部分"提前抓进磁盘缓存。
+     *
+     * <p><b>这是"预判用户下一步"。</b>用户在抽屉里上下浏览时，落点几乎一定
+     * 是相邻的几个台；按 OK 打开菜单则几乎一定是要换台。这时候后台把候选
+     * 频道的播放列表和图头几个分片抓下来，真的切过去时播放器直接从磁盘读，
+     * 首帧几乎是瞬时的——比任何"优化选源探测"都直接。
+     *
+     * <p>候选顺序按"越可能被选"排：焦点行本身优先，然后上下一格、
+     * 再上下两格。每个台只取它当前最可能用的那条线路
+     * （{@link #quickestSource}），不去预取一堆确定不会用的备胎。
+     *
+     * <p>正在播的那一路会被 {@link PlaybackCache} 自己跳过：它有带宽优先权，
+     * 预取它纯属浪费。
+     */
+    private void prefetchAround(int position) {
+        if (channels.isEmpty()) {
+            return;
+        }
+        java.util.List<String> urls = new java.util.ArrayList<>();
+        // 焦点行优先，然后向外扩展：±1、±2
+        int[] order = {0, -1, 1, -2, 2};
+        for (int d : order) {
+            int i = position + d;
+            if (i < 0 || i >= channels.size()) {
+                continue;
+            }
+            Channel c = channels.get(i);
+            if (c.sources.isEmpty()) {
+                continue;
+            }
+            int idx;
+            if (c == playingRef) {
+                // 正在播的台：用它真正在播的那条，但 PlaybackCache 会跳过
+                idx = sourceIndex;
+            } else {
+                idx = quickestSource(c);
+                if (idx < 0) {
+                    idx = 0;
+                }
+            }
+            String u = c.url(idx);
+            if (u != null && !urls.contains(u)) {
+                urls.add(u);
+            }
+        }
+        Channel playing = playingRef;
+        String playingUrl = playing == null ? null : playing.url(sourceIndex);
+        PlaybackCache.prefetch(this, urls, playingUrl);
     }
 
     /** 遥控器焦点是否落在左侧分组导航里。 */
@@ -3144,6 +3286,11 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
         ui.removeCallbacksAndMessages(null);
         VirtualRemote.release(this);
+        // 预取和缓冲指示器的 Handler 都要停，否则会一直持有 View 和已释放的播放器
+        PlaybackCache.cancelPrefetch();
+        if (bufferUi != null) {
+            bufferUi.release();
+        }
         if (player != null) {
             player.release();
             player = null;

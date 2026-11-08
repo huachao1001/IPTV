@@ -7,6 +7,13 @@ import java.util.List;
 /** 一个频道聚合了同一频道的多路流，界面上按清晰度区分。 */
 public class Channel {
 
+    /** 线路可信度：URL 代号与清单名字一致，铁证。 */
+    public static final int TRUST_VERIFIED = 2;
+    /** 线路可信度：没有任何线索，无从判断。 */
+    public static final int TRUST_UNKNOWN = 1;
+    /** 线路可信度：线索与清单名字矛盾，很可能是标错了。 */
+    public static final int TRUST_SUSPECT = 0;
+
     /** 一路流：播放地址 + 已知清晰度。 */
     public static class Source {
         public final String url;
@@ -28,6 +35,27 @@ public class Channel {
         public String measured;
         /** 源文件里记录的响应耗时，0 表示未知。 */
         public int responseMs;
+
+        /**
+         * 这条线路的可信度分档，见 {@code ChannelStore#assignTrust()}。
+         *
+         * <p>换台时优先选分高的线路，因为"名字与实际播出内容不一致"是上游清单
+         * 真实存在的问题（选「山东卫视」播英超、选「广东卫视」播 CCTV-11），
+         * 而本地无法从流内部读出台名（国内 IPTV 流的 SDT 表只有 {@code Service01}）。
+         *
+         * <p><b>分档依据全部来自清单自身的重复信息</b>，不猜测、不联网识别：
+         * <ol>
+         *   <li>{@link #TRUST_VERIFIED}：URL 里带厂商写的台名代号，且与清单名字一致。
+         *       这是<b>唯一可信的正向证据</b>，实测 120 条带代号的线路里 119 条自洽。</li>
+         *   <li>{@link #TRUST_UNKNOWN}：没有代号，也没有冲突线索，无从判断。</li>
+         *   <li>{@link #TRUST_SUSPECT}：代号与名字矛盾，或同频道号槽位被多个台名共用。</li>
+         * </ol>
+         *
+         * <p>排序只降权、<b>不删除</b>：不同机房的编号方案并不通用，
+         * 同一 {@code /hls/6/index.m3u8} 在 A 机房是 CCTV-5+、B 机房是 CCTV-6，
+         * 两边都可能对，删掉会误杀能播的线路。它仍留在列表里当备胎。
+         */
+        public int trust = TRUST_UNKNOWN;
 
         /**
          * 实测"喂不饱"标记。
@@ -131,23 +159,34 @@ public class Channel {
     }
 
     /**
-     * 按节目单自带的响应耗时升序排列，同一清晰度内最快的排前面。
+     * 排序：<b>可信度 → 清晰度 → 实测分辨率 → 响应耗时</b>。
      *
-     * <p>换台时直接用第 0 条起播，响应越快的线路出画面越快。
-     * 没有清晰度标记的线路（rank 相同）之间也按响应耗时排，
-     * 这样"最快可播"永远是第一条。
+     * <p>换台时直接用第 0 条起播，所以这个顺序就是"先试哪条线"。
      *
-     * <p>实测分辨率只作为<b>同档内</b>的次级排序依据：它是事实，
-     * 比猜测可信，但绝不能越级盖过节目单的声明档位。
+     * <p><b>为什么可信度排最前：</b>清单里确实存在错标——实测选「山东卫视」
+     * 播英超、选「黑龙江卫视」播美剧、选「广东卫视」播 CCTV-11 戏曲。
+     * 而带台名代号的线路（{@code ?id=sdwshd}、{@code /live/hnws.m3u8}）
+     * 是清单自身的正向证据，实测 120 条里 119 条与名字自洽。
+     * 让它们优先，等于用清单自己的信息纠正清单的错误。
+     *
+     * <p>可信度只在<b>同一清晰度档内</b>比较吗？——不是。
+     * 实测山东卫视的 1080P 线路统统没有代号、且播的是英超，
+     * 而带 {@code sdwshd} 代号的 1080P 线路排在它们后面。
+     * 若把可信度限制在档内比较，正确的线路永远轮不到，
+     * 所以可信度必须跨档优先：宁可先播一条确定的 576，
+     * 也不要先播一条错的 1080——后者用户一眼就能看出"这不是我要的台"。
      */
     public void sortBySpeed() {
         Collections.sort(sources, (a, b) -> {
+            if (a.trust != b.trust) {
+                return b.trust - a.trust;
+            }
             int qa = rank(a.quality);
             int qb = rank(b.quality);
             if (qa != qb) {
                 return qb - qa;
             }
-            // 同为无标记（或同档）时，实测分辨率高的排前面
+            // 同档内：实测分辨率高的排前面
             int ma = rank(a.measured);
             int mb = rank(b.measured);
             if (ma != mb) {
